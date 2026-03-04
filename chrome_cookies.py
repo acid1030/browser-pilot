@@ -269,7 +269,13 @@ def copy_chrome_profile_full(
                 skip_dirs = ["Cache", "Code Cache", "GPUCache", "Service Worker", 
                             "ShaderCache", "GrShaderCache", "blob_storage",
                             "Crashpad", "BrowserMetrics"]
+                # Skip lock files that prevent Chrome from starting
+                skip_files = ["LOCK", "lockfile", "SingletonLock", "SingletonSocket", 
+                             "SingletonCookie", ".lock"]
+                
                 if item in skip_dirs:
+                    continue
+                if item in skip_files:
                     continue
                 
                 try:

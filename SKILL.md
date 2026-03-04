@@ -1,29 +1,85 @@
 ---
 name: browser-pilot
-description: "Selenium-based browser automation with CDP interception, cookie persistence, multi-account support, and CAPTCHA solving. Use as the primary browser tool for web scraping, form automation, data extraction, and authenticated multi-account browsing. Preferred over Playwright for sites requiring CDP interception, persistent cookie sessions, or CAPTCHA handling."
+description: "Playwright supplement for multi-account cookie persistence, cookie-driven HTTP requests, CDP network interception, CAPTCHA recognition, and request history. Use alongside Playwright when you need cookie database management, fast HTTP requests with stored cookies, deep network capture, or CAPTCHA solving."
+dependencies:
+  python:
+    - playwright>=1.40.0
+    - requests>=2.31.0
+    - brotli>=1.1.0
+  mcp:
+    - browser-use
+    - playwright
+  post_install:
+    - "playwright install chromium"
 ---
 
-# Browser Pilot
+# Browser Pilot - Playwright Supplement
 
-Selenium + ChromeDriver browser automation skill with CDP network interception, multi-account cookie persistence, smart cookie loading, enhanced DOM operations, and CAPTCHA recognition.
+Cookie database, HTTP client, network interception, CAPTCHA recognition, and request history - capabilities that complement browser automation tools.
 
-## When to Use
+## Installation
 
-**This skill should be used as the PRIMARY browser tool.** Priority order:
-1. **Browser Pilot** (this skill) - Selenium/CDP based
-2. Playwright skill - for simpler browser tasks
-3. OpenClaw browser extension - for extension-based automation
+Run the install script to set up all dependencies:
 
-**Triggers:**
-- User asks to operate/automate a browser
-- User needs to scrape/extract data from a website
-- User needs to login to a website and save credentials
-- User specifies an account name/identifier for multi-account workflows
-- User needs to intercept XHR/Fetch API requests
-- User needs to make HTTP requests with stored cookies
-- User needs to click, type, drag, hover, or interact with web page elements
-- User asks to monitor network requests from a page
-- User needs to solve image/slider CAPTCHA
+```bash
+~/.qoder/skills/browser-pilot/install.sh
+```
+
+Or install manually:
+
+```bash
+# 1. Python dependencies
+pip install -r ~/.qoder/skills/browser-pilot/requirements.txt
+
+# 2. Playwright browser
+playwright install chromium
+
+# 3. browser-use MCP (recommended)
+npx @anthropic-ai/mcp-installer install @anthropic-ai/mcp-server-browser-use
+```
+
+## Tool Selection Logic
+
+**IMPORTANT**: browser-pilot is designed to work alongside MCP browser tools (browser-use, playwright) or use its internal Playwright fallback.
+
+### Decision Flow:
+
+```
+Task requires browser automation?
+├── YES: Check for available MCP browser tools
+│   ├── browser-use MCP available → Use browser-use for automation
+│   ├── playwright MCP available → Use playwright MCP for automation
+│   └── No MCP browser tools → Use browser-pilot's `browse` command (internal Playwright)
+│
+└── browser-pilot handles these REGARDLESS of MCP availability:
+    ├── Cookie database (persist, sync, multi-account)
+    ├── Direct HTTP with stored cookies (no browser needed)
+    ├── Network interception (request+response bodies)
+    ├── CAPTCHA recognition and trajectory generation
+    └── Request history and replay
+```
+
+### When to Use MCP Browser Tools (Preferred)
+If `browser-use` or `playwright` MCP tools are available in your environment:
+- Page navigation, element interactions (click, type, hover)
+- Login flows, form filling, screenshots
+- DOM operations, accessibility snapshots
+- Complex multi-step browser workflows
+
+### When to Use browser-pilot
+Always use browser-pilot for:
+- **Cookie persistence**: `cookies sync-from-playwright`, `cookies sync-to-playwright`
+- **Multi-account management**: Store cookies with `--account` parameter
+- **Fast HTTP requests**: `fetch --use-cookies` (10x faster than browser)
+- **Network capture**: `intercept` or `browse intercept-api` (full request+response bodies)
+- **CAPTCHA solving**: `captcha recognize`, `captcha find-gap`, `captcha trajectory`
+- **History/replay**: `history list`, `history replay`
+
+### When to Use `browse` Command (Internal Playwright Fallback)
+Use `browse` when:
+- No MCP browser tools available in environment
+- Need auto cookie sync with database (load on start, save on close)
+- Simple open-extract-close workflows
 
 ## CLI Reference
 
@@ -32,232 +88,227 @@ All commands are run via:
 python ~/.qoder/skills/browser-pilot/browser_pilot.py <command> [options]
 ```
 
-### open - Open browser to URL
+### browse - Self-contained Playwright with cookie persistence
+
+When MCP browser tools are unavailable, use these commands:
+
 ```bash
-python browser_pilot.py open --url URL [--profile NAME] [--account ACCOUNT]
-  [--headless] [--wait-login] [--smart-cookies] [--validate-url URL]
-  [--chrome-profile NAME] [--use-chrome-profile] [--force-copy]
-  [--check-url URL] [--check-selector SEL] [--timeout 300]
+# Open URL with auto cookie sync (loads from DB, saves on close)
+python browser_pilot.py browse open --url URL --site SITE [--account ACCOUNT]
+  [--headless] [--wait SECONDS] [--wait-until load|domcontentloaded|networkidle]
+  [--screenshot FILE] [--snapshot]
+
+# Extract data using JavaScript
+python browser_pilot.py browse extract --url URL --site SITE --script "JS_CODE"
+  [--account ACCOUNT] [--headless] [--wait SECONDS] [--output FILE]
+
+# Intercept API responses while browsing
+python browser_pilot.py browse intercept-api --url URL --site SITE
+  [--pattern REGEX] [--account ACCOUNT] [--headless] [--wait 30] [--output FILE]
 ```
-Opens a browser with stored cookies. Use `--account` to specify which account's cookies to use. Use `--smart-cookies` for intelligent cookie loading with Chrome fallback. Use `--use-chrome-profile` to copy and use Chrome profile directly (works even when Chrome is running).
 
-### login - Login flow
+**Examples:**
 ```bash
-# Auto-login with credentials
-python browser_pilot.py login --url URL --username USER --password PASS
-  [--account ACCOUNT] [--profile NAME] [--check-url URL] [--check-selector SEL]
+# Open page with cookies, take snapshot
+python browser_pilot.py browse open --url "https://example.com/dashboard" \
+  --site example.com --account user1 --snapshot
 
-# Manual login (opens browser, waits for you to login)
-python browser_pilot.py login --url URL [--account ACCOUNT] [--profile NAME] [--timeout 300]
+# Extract data from page
+python browser_pilot.py browse extract --url "https://example.com/profile" \
+  --site example.com --account user1 \
+  --script "Array.from(document.querySelectorAll('.item')).map(e => e.textContent)"
+
+# Capture API responses
+python browser_pilot.py browse intercept-api --url "https://example.com/feed" \
+  --site example.com --pattern "api/v2/posts" --wait 15 --output /tmp/posts.json
 ```
-After login detection, cookies are automatically saved to database under the specified account.
 
-### fetch - Fetch data
+### fetch - HTTP requests with stored cookies
+
 ```bash
-# Direct HTTP (fast, no browser)
+# Direct HTTP (fast, no browser needed)
 python browser_pilot.py fetch --url URL [--method GET] [--use-cookies SITE]
   [--account ACCOUNT] [--headers JSON] [--data JSON] [--output FILE]
 
-# CDP interception (browser-based)
+# Playwright-based interception (captures request+response bodies)
 python browser_pilot.py fetch --url URL --cdp [--pattern REGEX] [--wait 15] [--output FILE]
 ```
 
-### intercept - CDP network interception
+### intercept - Network interception
+
 ```bash
 python browser_pilot.py intercept --url URL --pattern REGEX [--wait 30]
-  [--profile NAME] [--headless] [--output FILE]
+  [--headless] [--output FILE]
 ```
-Loads a page and captures all network requests matching the URL pattern.
+Loads a page via Playwright and captures all network requests matching the URL pattern, including full POST bodies and response data.
 
-### cookies - Cookie management
+### cookies - Cookie management + sync
+
 ```bash
+# List stored cookies
 python browser_pilot.py cookies list [--site SITE] [--account ACCOUNT]
-python browser_pilot.py cookies export --site SITE [--account ACCOUNT] [--format json|header]
+
+# Export cookies
+python browser_pilot.py cookies export --site SITE [--account ACCOUNT] [--format json|header|playwright-json]
+
+# Import cookies from file
 python browser_pilot.py cookies import --site SITE --file FILE [--account ACCOUNT]
+
+# Delete cookies
 python browser_pilot.py cookies delete --site SITE [--account ACCOUNT]
+
+# Check cookie validity via HTTP
 python browser_pilot.py cookies check --site SITE --url URL [--account ACCOUNT]
+
+# Import from Chrome browser
 python browser_pilot.py cookies chrome --site SITE [--account ACCOUNT] [--chrome-profile Default]
+
+# List Chrome profiles
 python browser_pilot.py cookies profiles
+
+# Sync FROM Playwright/MCP -> DB
+python browser_pilot.py cookies sync-from-playwright --file PW_COOKIES.json [--site SITE] [--account ACCOUNT]
+
+# Sync TO Playwright/MCP <- DB
+python browser_pilot.py cookies sync-to-playwright --site SITE [--account ACCOUNT] [--output FILE]
 ```
 
 ### chrome - Chrome profile management
+
 ```bash
-# Copy Chrome profile (works when Chrome is running)
 python browser_pilot.py chrome copy [--chrome-profile Default] [--force]
-
-# List copied profiles
 python browser_pilot.py chrome list-copied
-
-# List available Chrome profiles
 python browser_pilot.py chrome list-chrome
-
-# Clean up old copied profiles
 python browser_pilot.py chrome cleanup [--keep 3]
-
-# Open browser with copied Chrome profile
-python browser_pilot.py chrome open-with-profile --url URL [--chrome-profile Default]
-  [--profile NAME] [--account ACCOUNT] [--headless] [--force] [--save-cookies]
-
-# Check if Chrome has cookies for a site
 python browser_pilot.py chrome check --site SITE [--chrome-profile Default]
 ```
 
 ### history - Request history
+
 ```bash
 python browser_pilot.py history list [--limit 20] [--site SITE]
 python browser_pilot.py history replay --id ID [--output FILE]
 ```
 
-### dom - DOM operations
-```bash
-python browser_pilot.py dom --url URL --action ACTION --selector SELECTOR
-  [--value VALUE] [--target TARGET] [--offset X,Y] [--direction up|down|left|right]
-  [--profile NAME] [--output FILE]
-```
+### captcha - CAPTCHA recognition + trajectory
 
-**Actions:**
-| Action | Description |
-|--------|-------------|
-| `click` | Click element |
-| `double_click` | Double click element |
-| `type` | Type text into element |
-| `type_human` | Type with human-like delays |
-| `extract` | Extract text/HTML from elements |
-| `screenshot` | Take page screenshot |
-| `find` | Find element (returns info) |
-| `hold` | Click and hold for duration |
-| `drag` | Drag to target or by offset |
-| `hover` | Hover over element |
-| `scroll` | Scroll page or to element |
-
-### captcha - CAPTCHA recognition
 ```bash
 # Check dependencies
 python browser_pilot.py captcha check
 
-# Recognize image CAPTCHA
+# Recognize image CAPTCHA from file
 python browser_pilot.py captcha recognize --file IMAGE.png
-python browser_pilot.py captcha image --url URL --selector "#captcha-img" [--input-selector "#input"]
+python browser_pilot.py captcha recognize --image-url URL
 
-# Solve slider CAPTCHA
-python browser_pilot.py captcha slider --url URL --selector ".slider" [--background ".bg"]
-python browser_pilot.py captcha find_gap --url URL --selector ".background"
+# Find slider gap position
+python browser_pilot.py captcha find-gap --file BACKGROUND.png [--slider-file SLIDER.png]
+
+# Generate human-like mouse trajectory
+python browser_pilot.py captcha trajectory --distance 187 [--duration 0.5] [--points 20]
 ```
 
-## Multi-Account Workflow
+## Integration Workflows
 
-When user specifies an account (e.g., "use account user1@example.com"), use the `--account` parameter:
+### Workflow 1: MCP Browser Login -> Fast HTTP
 
 ```bash
-# Login and save cookies for specific account
-python browser_pilot.py login --url https://example.com/login \
-  --account "user1@example.com" --check-selector ".avatar"
+# 1. AI logs in via browser-use/playwright MCP (navigate, fill, click)
+# 2. AI extracts cookies via MCP:
+#    browser_snapshot or evaluate: JSON.stringify(await page.context().cookies())
+#    -> save to /tmp/pw_cookies.json
 
-# Open with specific account's cookies
-python browser_pilot.py open --url https://example.com \
-  --account "user1@example.com" --smart-cookies
+# 3. Import to browser-pilot database for persistence
+python browser_pilot.py cookies sync-from-playwright \
+  --file /tmp/pw_cookies.json --site example.com --account user1
 
-# List cookies for specific account
-python browser_pilot.py cookies list --account "user1@example.com"
+# 4. Fast HTTP requests without browser (subsequent sessions)
+python browser_pilot.py fetch --url "https://api.example.com/data" \
+  --use-cookies example.com --account user1
 ```
 
-## Smart Cookie Loading
-
-Use `--smart-cookies` for intelligent cookie loading chain:
-1. **Database** → Load stored cookies
-2. **Validate** → HTTP test if `--validate-url` provided
-3. **Chrome Import** → Import from local Chrome if invalid/missing
+### Workflow 2: No MCP Available - Use browse Command
 
 ```bash
-python browser_pilot.py open --url https://example.com \
-  --smart-cookies --validate-url https://example.com/api/me \
-  --chrome-profile "Profile 1"
+# When no browser MCP tools are available, browser-pilot handles everything
+
+# Open page with auto cookie sync
+python browser_pilot.py browse open --url "https://example.com/dashboard" \
+  --site example.com --account user1 --snapshot
+
+# Extract structured data
+python browser_pilot.py browse extract --url "https://example.com/api-page" \
+  --site example.com --script "document.querySelector('#data').innerText" \
+  --output /tmp/data.json
 ```
 
-## Chrome Profile Copying (v2.1)
-
-**Problem**: When Chrome is running, its Cookie SQLite file is locked and cannot be read.
-
-**Solution**: Copy the Chrome profile directory instead of reading the Cookie file directly. This is similar to Playwright's persistent context approach.
+### Workflow 3: Multi-account Management
 
 ```bash
-# Copy Chrome profile (works when Chrome is running!)
-python browser_pilot.py chrome copy --chrome-profile Default
+# Import cookies for multiple accounts
+python browser_pilot.py cookies sync-from-playwright --file /tmp/user1.json --site shop.com --account user1
+python browser_pilot.py cookies sync-from-playwright --file /tmp/user2.json --site shop.com --account user2
 
-# Open browser with copied Chrome profile (inherits all cookies/sessions)
-python browser_pilot.py open --url https://example.com --use-chrome-profile
-
-# Or use the chrome command directly
-python browser_pilot.py chrome open-with-profile --url https://example.com \
-  --chrome-profile Default --save-cookies
+# Fetch data with different accounts
+python browser_pilot.py fetch --url "https://shop.com/api/orders" --use-cookies shop.com --account user1
+python browser_pilot.py fetch --url "https://shop.com/api/orders" --use-cookies shop.com --account user2
 ```
 
-**Key Benefits:**
-- Works even when Chrome is running
-- Inherits all cookies, sessions, local storage, indexed DB
-- No need to manually export/import cookies
-- Profile is isolated - changes don't affect original Chrome
-
-## Typical Workflow
-
-### Scenario: Multi-account scraping
+### Workflow 4: CAPTCHA Solving with MCP/Playwright
 
 ```bash
-# Step 1: Login Account 1
-python browser_pilot.py login --url https://shop.example.com/login \
-  --account "account1@gmail.com" --check-selector ".user-avatar"
+# 1. AI uses MCP/Playwright to screenshot the CAPTCHA background image
+#    -> saves to /tmp/captcha_bg.png
 
-# Step 2: Login Account 2
-python browser_pilot.py login --url https://shop.example.com/login \
-  --account "account2@gmail.com" --check-selector ".user-avatar"
+# 2. Detect gap position
+python browser_pilot.py captcha find-gap --file /tmp/captcha_bg.png
+# -> {"success": true, "x": 187, "y": 45, "method": "edge_detection"}
 
-# Step 3: Fetch data with Account 1
-python browser_pilot.py fetch --url "https://shop.example.com/api/orders" \
-  --use-cookies shop.example.com --account "account1@gmail.com"
+# 3. Generate human-like trajectory
+python browser_pilot.py captcha trajectory --distance 187
+# -> {"trajectory": [{"x": 5, "y": 0, "delay_ms": 25}, ...]}
 
-# Step 4: Fetch data with Account 2
-python browser_pilot.py fetch --url "https://shop.example.com/api/orders" \
-  --use-cookies shop.example.com --account "account2@gmail.com"
+# 4. AI executes trajectory via MCP/Playwright mouse API
 ```
 
-### Scenario: CAPTCHA handling
+### Workflow 5: Deep Network Capture
 
 ```bash
-# Open page with CAPTCHA
-python browser_pilot.py open --url https://example.com/login --wait-login
+# When MCP response monitoring isn't enough (need POST bodies)
+python browser_pilot.py intercept --url "https://example.com/page" \
+  --pattern "api/v2/.*" --wait 30
 
-# If image CAPTCHA detected
-python browser_pilot.py captcha image --url https://example.com/login \
-  --selector "#captcha-img" --input-selector "#captcha-input"
+# Or using browse command
+python browser_pilot.py browse intercept-api --url "https://example.com/page" \
+  --site example.com --pattern "api/v2/.*" --output /tmp/api_calls.json
 
-# If slider CAPTCHA detected
-python browser_pilot.py captcha slider --url https://example.com/login \
-  --selector ".slider-btn" --background ".slider-bg"
+# Replay captured requests later
+python browser_pilot.py history list --site example.com
+python browser_pilot.py history replay --id 42
 ```
 
-## Login Detection Logic
+### Workflow 6: Export Cookies Back to MCP/Playwright
 
-When `--wait-login` or `login` command is used, the tool polls every 5 seconds using these checks (in priority order):
-1. **CSS selector**: If `--check-selector` element exists in DOM
-2. **Check URL**: If `--check-url` returns HTTP 200 without redirect to login
-3. **URL pattern**: If current URL no longer contains "login/signin/auth"
-4. **Cookie count**: If browser has >5 cookies and URL is not a login page
+```bash
+# Export cookies in Playwright format for MCP session
+python browser_pilot.py cookies sync-to-playwright --site example.com \
+  --account user1 --output /tmp/pw_state.json
+
+# Use in MCP: context.add_cookies(json.load('/tmp/pw_state.json')['cookies'])
+```
 
 ## Data Storage
 
 - **Database**: `~/.qoder/browser-pilot/browser_pilot.db` (SQLite) or MySQL
-- **Chrome profiles**: `~/.qoder/browser-pilot/chrome-profiles/{profile_name}/`
-- **Copied Chrome profiles**: `~/.qoder/browser-pilot/chrome-imports/{name}/`
+- **Chrome imports**: `~/.qoder/browser-pilot/chrome-imports/`
 - **Tables**: `cookie_stores`, `request_history`, `login_states`
 - **Account field**: Cookies stored as `(site, account)` unique key
 
 ## Key Principles
 
-- Always use `--account` when user specifies account name/identifier
-- Use `--smart-cookies` for intelligent cookie loading with fallbacks
-- Save cookies after successful login
-- Use stored cookies for direct HTTP requests when possible (faster than browser)
-- Record all requests to history for replay capability
-- Isolate browser profiles per site/account
-- Auto-detect login without requiring user confirmation
-- Fall back gracefully when CDP features are unavailable
+1. **Prefer MCP browser tools** when available for complex browser automation
+2. **Use `browse` command** as fallback when no MCP tools exist
+3. **Always persist cookies** via `sync-from-playwright` after successful logins
+4. **Use `--account`** parameter for multi-account scenarios
+5. **Use HTTP fetch** with stored cookies for API calls (10x faster)
+6. **Use network interception** only when response body capture is needed
+7. **CAPTCHA**: recognize locally, output trajectory data for browser to execute

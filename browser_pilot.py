@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-Browser Pilot - Main CLI
-Selenium-based browser automation with CDP interception, cookie persistence,
-and auto-login detection for OpenClaw.
+Browser Pilot - Playwright Supplement CLI
+Multi-account cookie persistence, cookie-driven HTTP requests, CDP network
+interception, CAPTCHA recognition, and request history.
+
+Use alongside Playwright for capabilities it lacks:
+- Cookie database with multi-account support
+- Direct HTTP requests with stored cookies (no browser)
+- CDP full network interception (request + response bodies)
+- CAPTCHA image OCR and slider gap detection
+- Request history and replay
 
 Usage:
     python browser_pilot.py <command> [options]
 
 Commands:
-    open       Open browser to URL with smart cookie loading
-    login      Handle login flow (auto or manual)
     fetch      Fetch data via HTTP or CDP
     intercept  CDP network request interception
-    cookies    Cookie management (list/export/import/delete/check/chrome)
-    chrome     Chrome profile management (copy/list-copied/cleanup/open-with-profile)
+    cookies    Cookie management (list/export/import/delete/check/chrome/sync)
+    chrome     Chrome profile management (copy/list/cleanup)
     history    Request history (list/replay)
-    dom        DOM operations (click/type/extract/screenshot/find/hold/drag/hover/scroll)
-    captcha    CAPTCHA recognition (image/slider)
+    captcha    CAPTCHA recognition (recognize/find-gap/trajectory)
 """
 import sys
 import os
@@ -32,11 +36,9 @@ sys.path.insert(0, os.path.dirname(SKILL_DIR))
 # Use direct imports (not relative) for CLI execution
 sys.path.insert(0, SKILL_DIR)
 import db
-import driver as drv
 import cookie_manager as cm
 import http_client as hc
 import interceptor as icp
-import dom_helper as dom
 import captcha_solver as captcha
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -57,272 +59,40 @@ def output_error(msg):
     output_json({"error": str(msg)}, success=False)
 
 
-# ─── Command: open ───
-
-def cmd_open(args):
-    """Open browser to URL with smart cookie loading (DB -> validate -> Chrome)."""
-    driver = None
-    try:
-        site = cm.extract_site(args.url)
-        account = getattr(args, 'account', None)
-        
-        # Option 1: Use copied Chrome profile directly (works when Chrome is running)
-        if args.use_chrome_profile:
-            log.info(f"Opening with Chrome profile: {args.chrome_profile or 'Default'}")
-            driver, profile_path = drv.create_driver_with_chrome_profile(
-                chrome_profile=args.chrome_profile or "Default",
-                headless=args.headless,
-                force_copy=args.force_copy
-            )
-            if not driver:
-                output_error(f"Failed to copy Chrome profile: {profile_path}")
-                return
-            
-            driver.get(args.url)
-            log.info(f"Opened {args.url} with Chrome profile (inherits all cookies/sessions)")
-            
-            if args.wait_login:
-                success = cm.wait_for_login(
-                    driver,
-                    check_url=args.check_url,
-                    check_selector=args.check_selector,
-                    timeout=args.timeout,
-                )
-                if success:
-                    count = cm.save_from_driver(driver, site, args.profile, account=account)
-                    db.update_login_state(site, True, args.check_url, args.check_selector, account=account)
-                    output_json({"message": f"Login detected, saved {count} cookies", "site": site, "account": account})
-                else:
-                    output_json({"message": "Login timeout"}, success=False)
-            else:
-                output_json({
-                    "message": f"Browser opened at {args.url}",
-                    "site": site,
-                    "account": account,
-                    "chrome_profile_path": profile_path,
-                    "cookies": {"source": "chrome_profile", "count": "inherited", "valid": True}
-                })
-                try:
-                    input("Press Enter to close browser...")
-                except (EOFError, KeyboardInterrupt):
-                    pass
-            return
-        
-        # Option 2: Standard browser-pilot profile
-        driver = drv.create_driver(profile=args.profile, headless=args.headless)
-
-        # Smart cookie loading with validation and Chrome fallback
-        if args.smart_cookies:
-            load_result = cm.smart_load_cookies(
-                driver,
-                site,
-                test_url=args.validate_url,
-                chrome_profile=args.chrome_profile or "Default",
-                account=account
-            )
-            driver.get(args.url)
-            if load_result["valid"]:
-                log.info(f"Opened {args.url} with valid cookies from {load_result['source']}" + 
-                        (f" (account: {account})" if account else ""))
-            else:
-                log.info(f"Opened {args.url} (no valid cookies found)")
-        else:
-            # Original behavior: load from database if available
-            cookies = db.load_cookies(site, account=account)
-            if cookies:
-                cm.load_to_driver(driver, site, args.url, account=account)
-                driver.get(args.url)
-                log.info(f"Opened {args.url} with stored cookies" + 
-                        (f" (account: {account})" if account else ""))
-            else:
-                driver.get(args.url)
-                log.info(f"Opened {args.url} (no stored cookies)")
-
-        if args.wait_login:
-            success = cm.wait_for_login(
-                driver,
-                check_url=args.check_url,
-                check_selector=args.check_selector,
-                timeout=args.timeout,
-            )
-            if success:
-                count = cm.save_from_driver(driver, site, args.profile, account=account)
-                db.update_login_state(site, True, args.check_url, args.check_selector, account=account)
-                output_json({"message": f"Login detected, saved {count} cookies", "site": site, "account": account})
-            else:
-                output_json({"message": "Login timeout"}, success=False)
-        else:
-            # Keep browser open, wait for user to close
-            cookie_info = {"source": "unknown", "count": 0}
-            if args.smart_cookies:
-                cookie_info = load_result
-            output_json({
-                "message": f"Browser opened at {args.url}",
-                "site": site,
-                "account": account,
-                "cookies": cookie_info
-            })
-            try:
-                input("Press Enter to close browser...")
-            except (EOFError, KeyboardInterrupt):
-                pass
-
-    except Exception as e:
-        output_error(e)
-    finally:
-        if driver and not args.wait_login:
-            pass  # User controls when to close
-        elif driver:
-            drv.close_driver(driver)
-
-
-# ─── Command: login ───
-
-def cmd_login(args):
-    """Handle login flow - auto or manual."""
-    driver = None
-    try:
-        driver = drv.create_driver(profile=args.profile, headless=False)
-        site = cm.extract_site(args.url)
-        driver.get(args.url)
-        time.sleep(2)
-
-        if args.username and args.password:
-            # Auto-login with Selenium
-            from selenium.webdriver.common.by import By
-            from selenium.webdriver.support.ui import WebDriverWait
-            from selenium.webdriver.support import expected_conditions as EC
-
-            log.info(f"Auto-login to {args.url}")
-
-            # Find and fill username
-            user_selectors = [
-                args.selector_user,
-                "input[type='email']", "input[type='text']",
-                "input[name='username']", "input[name='email']",
-                "input[name='account']", "input[name='loginId']",
-                "#username", "#email", "#account",
-            ]
-            user_el = None
-            for sel in user_selectors:
-                if not sel:
-                    continue
-                try:
-                    user_el = WebDriverWait(driver, 5).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, sel))
-                    )
-                    break
-                except Exception:
-                    continue
-
-            if not user_el:
-                output_error("Could not find username input field")
-                return
-
-            user_el.clear()
-            time.sleep(0.5)
-            user_el.send_keys(args.username)
-            time.sleep(0.5)
-
-            # Find and fill password
-            pass_selectors = [
-                args.selector_pass,
-                "input[type='password']",
-                "input[name='password']", "input[name='pwd']",
-                "#password",
-            ]
-            pass_el = None
-            for sel in pass_selectors:
-                if not sel:
-                    continue
-                try:
-                    pass_el = driver.find_element(By.CSS_SELECTOR, sel)
-                    break
-                except Exception:
-                    continue
-
-            if not pass_el:
-                output_error("Could not find password input field")
-                return
-
-            pass_el.clear()
-            time.sleep(0.5)
-            pass_el.send_keys(args.password)
-            time.sleep(0.5)
-
-            # Submit
-            submit_selectors = [
-                "button[type='submit']", "input[type='submit']",
-                "button.login-btn", "button.submit",
-                "button:not([type='button'])",
-            ]
-            for sel in submit_selectors:
-                try:
-                    btn = driver.find_element(By.CSS_SELECTOR, sel)
-                    btn.click()
-                    break
-                except Exception:
-                    continue
-
-            log.info("Credentials submitted, waiting for login...")
-            time.sleep(3)
-
-        # Wait for login (manual or post-auto)
-        success = cm.wait_for_login(
-            driver,
-            check_url=args.check_url,
-            check_selector=args.check_selector,
-            timeout=args.timeout,
-        )
-
-        account = getattr(args, 'account', None)
-        if success:
-            count = cm.save_from_driver(driver, site, args.profile, account=account)
-            db.update_login_state(site, True, args.check_url, args.check_selector, account=account)
-            output_json({"message": f"Login successful, saved {count} cookies", "site": site, "account": account})
-        else:
-            # Save whatever cookies we have anyway
-            cm.save_from_driver(driver, site, args.profile, account=account)
-            db.update_login_state(site, False, account=account)
-            output_json({"message": "Login detection timed out, cookies saved anyway", "site": site, "account": account}, success=False)
-
-    except Exception as e:
-        output_error(e)
-    finally:
-        drv.close_driver(driver)
-
-
 # ─── Command: fetch ───
 
 def cmd_fetch(args):
-    """Fetch data via HTTP or CDP."""
+    """Fetch data via HTTP or CDP (Playwright-based interception)."""
     try:
         if args.cdp:
-            # Browser-based CDP fetch
-            driver = drv.create_driver(profile=args.profile, headless=True)
-            try:
-                site = cm.extract_site(args.url)
-                if args.use_cookies:
-                    cm.load_to_driver(driver, args.use_cookies, args.url)
+            # Browser-based interception using Playwright
+            site = args.use_cookies or cm.extract_site(args.url)
+            account = getattr(args, 'account', None)
+            
+            results = icp.intercept_page(
+                page_url=args.url,
+                url_pattern=args.pattern or ".*",
+                wait_seconds=args.wait or 15,
+                site=site,
+                account=account,
+                headless=True
+            )
+            
+            for r in results:
+                db.save_request(
+                    url=r["url"], method=r.get("method", "GET"),
+                    headers=r.get("request_headers"),
+                    status_code=r.get("status"),
+                    response_preview=r.get("body", "")[:2000],
+                    via="playwright", site=site,
+                )
 
-                results = icp.intercept_page(driver, args.url, args.pattern or ".*", args.wait or 15)
-                for r in results:
-                    db.save_request(
-                        url=r["url"], method=r.get("method", "GET"),
-                        headers=r.get("request_headers"),
-                        status_code=r.get("status"),
-                        response_preview=r.get("body", "")[:2000],
-                        via="cdp", site=site,
-                    )
-
-                if args.output:
-                    with open(args.output, "w", encoding="utf-8") as f:
-                        json.dump(results, f, ensure_ascii=False, indent=2)
-                    output_json({"message": f"Saved {len(results)} responses to {args.output}"})
-                else:
-                    output_json({"count": len(results), "results": results})
-            finally:
-                drv.close_driver(driver)
+            if args.output:
+                with open(args.output, "w", encoding="utf-8") as f:
+                    json.dump(results, f, ensure_ascii=False, indent=2)
+                output_json({"message": f"Saved {len(results)} responses to {args.output}"})
+            else:
+                output_json({"count": len(results), "results": results})
         else:
             # Direct HTTP
             headers = json.loads(args.headers) if args.headers else None
@@ -348,18 +118,19 @@ def cmd_fetch(args):
 # ─── Command: intercept ───
 
 def cmd_intercept(args):
-    """CDP network interception."""
-    driver = None
+    """Network interception using Playwright."""
     try:
-        driver = drv.create_driver(profile=args.profile, headless=args.headless)
         site = cm.extract_site(args.url)
-
-        # Load cookies if available
-        cookies = db.load_cookies(site)
-        if cookies:
-            cm.load_to_driver(driver, site, args.url)
-
-        results = icp.intercept_page(driver, args.url, args.pattern, args.wait)
+        account = getattr(args, 'account', None)
+        
+        results = icp.intercept_page(
+            page_url=args.url,
+            url_pattern=args.pattern,
+            wait_seconds=args.wait,
+            site=site,
+            account=account,
+            headless=args.headless
+        )
 
         for r in results:
             db.save_request(
@@ -368,7 +139,7 @@ def cmd_intercept(args):
                 body=r.get("post_data"),
                 status_code=r.get("status"),
                 response_preview=r.get("body", "")[:2000],
-                via="cdp", site=site,
+                via="playwright", site=site,
             )
 
         if args.output:
@@ -380,8 +151,6 @@ def cmd_intercept(args):
 
     except Exception as e:
         output_error(e)
-    finally:
-        drv.close_driver(driver)
 
 
 # ─── Command: cookies ───
@@ -409,6 +178,9 @@ def cmd_cookies(args):
             if args.format == "header":
                 header_str = cm.cookies_as_header_string(args.site, account=account)
                 output_json({"cookie_header": header_str, "account": account})
+            elif args.format == "playwright-json":
+                pw_data = cm.export_as_playwright_json(args.site, account=account)
+                output_json(pw_data)
             else:
                 cookies = json.loads(store["cookies_json"])
                 output_json({"site": args.site, "account": store.get("account"), "cookies": cookies})
@@ -454,6 +226,35 @@ def cmd_cookies(args):
             profiles = cm.list_chrome_profiles()
             output_json({"chrome_profiles": profiles})
 
+        elif action == "sync-from-playwright":
+            # Import cookies from Playwright JSON file
+            if not args.file:
+                output_error("--file is required for sync-from-playwright")
+                return
+            result = cm.save_from_playwright_json(
+                file_path=args.file,
+                site=getattr(args, 'site', None),
+                profile=getattr(args, 'profile', 'default'),
+                account=account
+            )
+            output_json(result)
+
+        elif action == "sync-to-playwright":
+            # Export cookies in Playwright format
+            if not args.site:
+                output_error("--site is required for sync-to-playwright")
+                return
+            pw_data = cm.export_as_playwright_json(args.site, account=account)
+            if not pw_data["cookies"]:
+                output_error(f"No cookies found for {args.site}" + (f" (account: {account})" if account else ""))
+                return
+            if args.output:
+                with open(args.output, "w", encoding="utf-8") as f:
+                    json.dump(pw_data, f, ensure_ascii=False, indent=2)
+                output_json({"message": f"Exported {len(pw_data['cookies'])} cookies to {args.output}", "format": "playwright-json"})
+            else:
+                output_json(pw_data)
+
     except Exception as e:
         output_error(e)
 
@@ -461,14 +262,13 @@ def cmd_cookies(args):
 # ─── Command: chrome ───
 
 def cmd_chrome(args):
-    """Chrome profile management - copy, list, cleanup, open with copied profile."""
+    """Chrome profile management - copy, list, cleanup."""
     import chrome_cookies
     
     try:
         action = args.chrome_action
         
         if action == "copy":
-            # Copy Chrome profile directory (works even when Chrome is running)
             result = chrome_cookies.copy_chrome_profile_full(
                 chrome_profile=args.chrome_profile or "Default",
                 force=args.force
@@ -476,64 +276,19 @@ def cmd_chrome(args):
             output_json(result)
         
         elif action == "list-copied":
-            # List all copied Chrome profiles
             profiles = chrome_cookies.get_copied_profiles()
             output_json({"copied_profiles": profiles})
         
         elif action == "list-chrome":
-            # List available Chrome profiles on system
             profiles = chrome_cookies.list_chrome_profiles()
             output_json({"chrome_profiles": profiles})
         
         elif action == "cleanup":
-            # Clean up old copied profiles
             keep = args.keep or 3
             removed = chrome_cookies.cleanup_old_profiles(keep_count=keep)
             output_json({"message": f"Removed {removed} old profile copies", "kept": keep})
         
-        elif action == "open-with-profile":
-            # Open browser using copied Chrome profile
-            if not args.url:
-                output_error("--url is required")
-                return
-            
-            driver, profile_path = drv.create_driver_with_chrome_profile(
-                chrome_profile=args.chrome_profile or "Default",
-                headless=args.headless,
-                force_copy=args.force
-            )
-            
-            if not driver:
-                output_error(f"Failed to create driver: {profile_path}")
-                return
-            
-            try:
-                driver.get(args.url)
-                site = cm.extract_site(args.url)
-                
-                output_json({
-                    "message": f"Browser opened with Chrome profile",
-                    "url": args.url,
-                    "profile_path": profile_path,
-                    "site": site
-                })
-                
-                try:
-                    input("Press Enter to close browser...")
-                except (EOFError, KeyboardInterrupt):
-                    pass
-                
-                # Optionally save cookies to database
-                if args.save_cookies:
-                    account = getattr(args, 'account', None)
-                    count = cm.save_from_driver(driver, site, args.profile or "default", account=account)
-                    log.info(f"Saved {count} cookies for {site}")
-                    
-            finally:
-                drv.close_driver(driver)
-        
         elif action == "check":
-            # Check if Chrome has cookies for a site
             if not args.site:
                 output_error("--site is required")
                 return
@@ -591,175 +346,111 @@ def cmd_history(args):
         output_error(e)
 
 
-# ─── Command: dom ───
+# ─── Command: browse ───
 
-def cmd_dom(args):
-    """DOM operations on a web page."""
-    driver = None
+def cmd_browse(args):
+    """Self-contained Playwright browser operations with cookie persistence."""
+    from playwright_browser import PlaywrightBrowser
+    
     try:
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-
-        driver = drv.create_driver(profile=args.profile, headless=args.headless)
-        site = cm.extract_site(args.url)
-
-        # Load cookies if available
-        cookies = db.load_cookies(site)
-        if cookies:
-            cm.load_to_driver(driver, site, args.url)
-
-        driver.get(args.url)
-        time.sleep(args.wait or 3)
-
-        # Determine selector type
-        by = By.XPATH if args.selector.startswith("//") or args.selector.startswith("(") else By.CSS_SELECTOR
-
-        if args.action == "click":
-            el = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((by, args.selector)))
-            el.click()
-            time.sleep(1)
-            output_json({"message": f"Clicked element: {args.selector}"})
-
-        elif args.action == "type":
-            el = WebDriverWait(driver, 10).until(EC.presence_of_element_located((by, args.selector)))
-            el.clear()
-            el.send_keys(args.value or "")
-            output_json({"message": f"Typed into element: {args.selector}"})
-
-        elif args.action == "extract":
-            elements = driver.find_elements(by, args.selector)
-            extracted = []
-            for el in elements:
-                extracted.append({
-                    "text": el.text,
-                    "tag": el.tag_name,
-                    "html": el.get_attribute("innerHTML")[:500],
-                })
-            output_json({"count": len(extracted), "elements": extracted})
-
-        elif args.action == "screenshot":
-            output_path = args.output or "/tmp/browser_pilot_screenshot.png"
-            driver.save_screenshot(output_path)
-            output_json({"message": f"Screenshot saved to {output_path}"})
-
-        # ─── New DOM actions using dom_helper ───
-        elif args.action == "find":
-            # Find element by various methods (text, class, id, name, tag)
-            el = dom.find_element_smart(driver, args.selector, timeout=10)
-            if el:
-                info = dom.get_element_info(el)
-                output_json({"found": True, "element": info})
+        action = args.browse_action
+        site = args.site
+        account = getattr(args, 'account', None)
+        
+        if action == "open":
+            # Open URL with auto cookie sync
+            with PlaywrightBrowser(
+                site=site,
+                account=account,
+                headless=getattr(args, 'headless', False)
+            ) as browser:
+                browser.goto(args.url, wait_until=getattr(args, 'wait_until', 'load'))
+                
+                result = {"url": args.url, "site": site}
+                
+                if getattr(args, 'wait', None):
+                    import time
+                    time.sleep(args.wait)
+                
+                if getattr(args, 'snapshot', False):
+                    snapshot = browser.snapshot()
+                    result["snapshot"] = snapshot
+                
+                if getattr(args, 'screenshot', None):
+                    browser.screenshot(args.screenshot)
+                    result["screenshot"] = args.screenshot
+                
+                output_json(result)
+        
+        elif action == "extract":
+            # Extract data using JavaScript
+            if not args.script:
+                output_error("--script is required for extract")
+                return
+            
+            with PlaywrightBrowser(
+                site=site,
+                account=account,
+                headless=getattr(args, 'headless', True)
+            ) as browser:
+                browser.goto(args.url)
+                
+                if getattr(args, 'wait', None):
+                    import time
+                    time.sleep(args.wait)
+                
+                # Execute extraction script
+                data = browser.evaluate(args.script)
+                
+                result = {"url": args.url, "data": data}
+                
+                if args.output:
+                    with open(args.output, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    result["saved_to"] = args.output
+                
+                output_json(result)
+        
+        elif action == "intercept-api":
+            # Intercept API responses while browsing
+            pattern = args.pattern or ".*"
+            wait = getattr(args, 'wait', 30)
+            
+            results = icp.intercept_page(
+                page_url=args.url,
+                url_pattern=pattern,
+                wait_seconds=wait,
+                site=site,
+                account=account,
+                headless=getattr(args, 'headless', False)
+            )
+            
+            if args.output:
+                with open(args.output, "w", encoding="utf-8") as f:
+                    json.dump(results, f, ensure_ascii=False, indent=2)
+                output_json({"message": f"Captured {len(results)} responses", "saved_to": args.output})
             else:
-                output_json({"found": False, "message": f"Element not found: {args.selector}"})
-
-        elif args.action == "hold":
-            # Click and hold element for duration
-            duration = float(args.value) if args.value else 2.0
-            el = dom.find_element_smart(driver, args.selector, timeout=10)
-            if el:
-                dom.hold_element(driver, el, duration)
-                output_json({"message": f"Held element for {duration}s: {args.selector}"})
-            else:
-                output_json({"found": False, "message": f"Element not found: {args.selector}"}, success=False)
-
-        elif args.action == "drag":
-            # Drag from source to target (or by offset)
-            el = dom.find_element_smart(driver, args.selector, timeout=10)
-            if not el:
-                output_json({"found": False, "message": f"Source element not found: {args.selector}"}, success=False)
-            elif args.target:
-                # Drag to target element
-                target_el = dom.find_element_smart(driver, args.target, timeout=10)
-                if target_el:
-                    dom.drag_element(driver, el, target_el)
-                    output_json({"message": f"Dragged {args.selector} to {args.target}"})
-                else:
-                    output_json({"found": False, "message": f"Target element not found: {args.target}"}, success=False)
-            elif args.offset:
-                # Drag by offset (x,y)
-                try:
-                    x, y = map(int, args.offset.split(","))
-                    dom.drag_element(driver, el, offset_x=x, offset_y=y)
-                    output_json({"message": f"Dragged {args.selector} by offset ({x}, {y})"})
-                except ValueError:
-                    output_json({"error": "Invalid offset format. Use: x,y"}, success=False)
-            else:
-                output_json({"error": "Drag requires --target or --offset"}, success=False)
-
-        elif args.action == "hover":
-            # Hover over element
-            el = dom.find_element_smart(driver, args.selector, timeout=10)
-            if el:
-                dom.hover_element(driver, el)
-                time.sleep(0.5)
-                output_json({"message": f"Hovering over: {args.selector}"})
-            else:
-                output_json({"found": False, "message": f"Element not found: {args.selector}"}, success=False)
-
-        elif args.action == "scroll":
-            # Scroll page or to element
-            if args.selector == "page":
-                # Scroll page by amount
-                direction = args.direction or "down"
-                amount = int(args.value) if args.value else 500
-                dom.scroll_page(driver, direction, amount)
-                output_json({"message": f"Scrolled {direction} by {amount}px"})
-            else:
-                # Scroll to element
-                el = dom.find_element_smart(driver, args.selector, timeout=10)
-                if el:
-                    dom.scroll_to_element(driver, el)
-                    output_json({"message": f"Scrolled to: {args.selector}"})
-                else:
-                    output_json({"found": False, "message": f"Element not found: {args.selector}"}, success=False)
-
-        elif args.action == "double_click":
-            el = dom.find_element_smart(driver, args.selector, timeout=10)
-            if el:
-                dom.click_element(driver, el, double=True)
-                output_json({"message": f"Double-clicked: {args.selector}"})
-            else:
-                output_json({"found": False, "message": f"Element not found: {args.selector}"}, success=False)
-
-        elif args.action == "type_human":
-            # Type with human-like delays
-            el = dom.find_element_smart(driver, args.selector, timeout=10)
-            if el:
-                dom.type_text(driver, el, args.value or "", human_like=True)
-                output_json({"message": f"Typed (human-like) into: {args.selector}"})
-            else:
-                output_json({"found": False, "message": f"Element not found: {args.selector}"}, success=False)
-
+                output_json({"count": len(results), "results": results})
+        
         else:
-            output_json({"error": f"Unknown action: {args.action}"}, success=False)
-
-        # Save cookies after any DOM operation
-        cm.save_from_driver(driver, site, args.profile)
-
+            output_json({"error": f"Unknown browse action: {action}"}, success=False)
+    
     except Exception as e:
         output_error(e)
-    finally:
-        if args.action != "screenshot" or not args.keep_open:
-            drv.close_driver(driver)
 
 
 # ─── Command: captcha ───
 
 def cmd_captcha(args):
-    """CAPTCHA recognition and solving."""
-    driver = None
+    """CAPTCHA recognition and trajectory generation."""
     try:
         action = args.captcha_action
 
         if action == "check":
-            # Check CAPTCHA dependencies
             deps = captcha.check_dependencies()
             output_json(deps)
-            return
 
-        if action == "recognize":
-            # Recognize image CAPTCHA from file or URL
+        elif action == "recognize":
             if args.file:
                 with open(args.file, "rb") as f:
                     image_data = f.read()
@@ -771,120 +462,45 @@ def cmd_captcha(args):
                 output_json(result)
             else:
                 output_json({"error": "--file or --image-url required"}, success=False)
-            return
 
-        # Browser-based CAPTCHA operations
-        driver = drv.create_driver(profile=args.profile, headless=args.headless)
-        site = cm.extract_site(args.url)
-
-        # Load cookies
-        cookies = db.load_cookies(site)
-        if cookies:
-            cm.load_to_driver(driver, site, args.url)
-
-        driver.get(args.url)
-        time.sleep(args.wait or 3)
-
-        if action == "image":
-            # Recognize CAPTCHA from element on page
-            el = dom.find_element_smart(driver, args.selector, timeout=10)
-            if not el:
-                output_json({"error": f"CAPTCHA element not found: {args.selector}"}, success=False)
+        elif action == "find-gap":
+            if not args.file:
+                output_error("--file is required (background image)")
                 return
-
-            solver = captcha.get_solver(args.api_key, args.api_provider or "2captcha")
-            result = solver.recognize_image_from_element(driver, el)
-
-            if result["success"] and args.input_selector:
-                # Auto-fill the recognized text
-                input_el = dom.find_element_smart(driver, args.input_selector, timeout=5)
-                if input_el:
-                    dom.type_text(driver, input_el, result["text"])
-                    result["auto_filled"] = True
-
+            with open(args.file, "rb") as f:
+                bg_data = f.read()
+            slider_data = None
+            if args.slider_file:
+                with open(args.slider_file, "rb") as f:
+                    slider_data = f.read()
+            result = captcha.find_gap(bg_data, slider_data)
             output_json(result)
 
-        elif action == "slider":
-            # Solve slider CAPTCHA
-            slider_el = dom.find_element_smart(driver, args.selector, timeout=10)
-            if not slider_el:
-                output_json({"error": f"Slider element not found: {args.selector}"}, success=False)
+        elif action == "trajectory":
+            if not args.distance:
+                output_error("--distance is required")
                 return
-
-            bg_el = None
-            if args.background:
-                bg_el = dom.find_element_smart(driver, args.background, timeout=5)
-
-            gap_x = int(args.gap_x) if args.gap_x else None
-
-            solver = captcha.get_solver()
-            result = solver.solve_slider(driver, slider_el, bg_el, gap_x)
-
-            # Wait a bit and check if solved
-            time.sleep(1)
-            output_json(result)
-
-        elif action == "find_gap":
-            # Just find gap position without dragging
-            bg_el = dom.find_element_smart(driver, args.selector, timeout=10)
-            if not bg_el:
-                output_json({"error": f"Background element not found: {args.selector}"}, success=False)
-                return
-
-            bg_image = bg_el.screenshot_as_png
-            result = captcha.find_gap(bg_image)
+            result = captcha.generate_trajectory(
+                distance=args.distance,
+                duration=args.duration or 0.5,
+                points=args.points or 20
+            )
             output_json(result)
 
         else:
             output_json({"error": f"Unknown captcha action: {action}"}, success=False)
 
-        # Save cookies after operations
-        cm.save_from_driver(driver, site, args.profile)
-
     except Exception as e:
         output_error(e)
-    finally:
-        if driver:
-            drv.close_driver(driver)
 
 
 # ─── Argument Parser ───
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Browser Pilot - Selenium browser automation with CDP"
+        description="Browser Pilot - Playwright supplement for cookies, HTTP, CDP, and CAPTCHA"
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
-
-    # ── open ──
-    p_open = subparsers.add_parser("open", help="Open browser to URL")
-    p_open.add_argument("--url", required=True, help="Target URL")
-    p_open.add_argument("--profile", default="default", help="Browser profile name")
-    p_open.add_argument("--account", help="Account identifier for multi-account cookie storage")
-    p_open.add_argument("--headless", action="store_true", help="Run headless")
-    p_open.add_argument("--wait-login", action="store_true", help="Wait for login")
-    p_open.add_argument("--check-url", help="URL to verify login status")
-    p_open.add_argument("--check-selector", help="CSS selector indicating logged-in state")
-    p_open.add_argument("--timeout", type=int, default=300, help="Login wait timeout (seconds)")
-    p_open.add_argument("--smart-cookies", action="store_true", help="Enable smart cookie loading (DB -> validate -> Chrome)")
-    p_open.add_argument("--validate-url", help="URL to validate cookies (for smart loading)")
-    p_open.add_argument("--chrome-profile", help="Chrome profile name for cookie import (default: Default)")
-    p_open.add_argument("--use-chrome-profile", action="store_true", 
-                       help="Copy and use Chrome profile directly (works when Chrome is running)")
-    p_open.add_argument("--force-copy", action="store_true", help="Force re-copy Chrome profile")
-
-    # ── login ──
-    p_login = subparsers.add_parser("login", help="Handle login flow")
-    p_login.add_argument("--url", required=True, help="Login page URL")
-    p_login.add_argument("--username", help="Username/email for auto-login")
-    p_login.add_argument("--password", help="Password for auto-login")
-    p_login.add_argument("--selector-user", help="CSS selector for username input")
-    p_login.add_argument("--selector-pass", help="CSS selector for password input")
-    p_login.add_argument("--check-url", help="URL to verify login")
-    p_login.add_argument("--check-selector", help="Selector indicating logged-in state")
-    p_login.add_argument("--profile", default="default", help="Browser profile")
-    p_login.add_argument("--account", help="Account identifier for multi-account cookie storage")
-    p_login.add_argument("--timeout", type=int, default=300, help="Wait timeout")
 
     # ── fetch ──
     p_fetch = subparsers.add_parser("fetch", help="Fetch data via HTTP or CDP")
@@ -920,7 +536,7 @@ def build_parser():
     p_ce = p_cookies_sub.add_parser("export", help="Export cookies")
     p_ce.add_argument("--site", required=True, help="Site to export")
     p_ce.add_argument("--account", help="Account identifier")
-    p_ce.add_argument("--format", choices=["json", "header"], default="json")
+    p_ce.add_argument("--format", choices=["json", "header", "playwright-json"], default="json")
 
     p_ci = p_cookies_sub.add_parser("import", help="Import cookies from file")
     p_ci.add_argument("--site", required=True, help="Site name")
@@ -930,7 +546,7 @@ def build_parser():
 
     p_cd = p_cookies_sub.add_parser("delete", help="Delete stored cookies")
     p_cd.add_argument("--site", required=True, help="Site to delete")
-    p_cd.add_argument("--account", help="Account identifier (delete only this account's cookies)")
+    p_cd.add_argument("--account", help="Account identifier")
 
     p_cc = p_cookies_sub.add_parser("check", help="Check cookie validity")
     p_cc.add_argument("--site", required=True, help="Site to check")
@@ -941,33 +557,35 @@ def build_parser():
     p_cchr.add_argument("--site", required=True, help="Site to import cookies for")
     p_cchr.add_argument("--chrome-profile", default="Default", help="Chrome profile name")
     p_cchr.add_argument("--profile", default="default", help="Database profile")
-    p_cchr.add_argument("--account", help="Account identifier to save under")
+    p_cchr.add_argument("--account", help="Account identifier")
 
     p_cprof = p_cookies_sub.add_parser("profiles", help="List Chrome profiles")
+
+    p_sync_from = p_cookies_sub.add_parser("sync-from-playwright", help="Import cookies from Playwright JSON")
+    p_sync_from.add_argument("--file", required=True, help="Playwright cookies JSON file path")
+    p_sync_from.add_argument("--site", help="Site to save under (auto-groups by domain if omitted)")
+    p_sync_from.add_argument("--account", help="Account identifier")
+    p_sync_from.add_argument("--profile", default="default", help="Database profile")
+
+    p_sync_to = p_cookies_sub.add_parser("sync-to-playwright", help="Export cookies in Playwright format")
+    p_sync_to.add_argument("--site", required=True, help="Site to export")
+    p_sync_to.add_argument("--account", help="Account identifier")
+    p_sync_to.add_argument("--output", help="Output file path (stdout if omitted)")
 
     # ── chrome ──
     p_chrome = subparsers.add_parser("chrome", help="Chrome profile management")
     p_chrome_sub = p_chrome.add_subparsers(dest="chrome_action")
 
-    p_chr_copy = p_chrome_sub.add_parser("copy", help="Copy Chrome profile directory (works when Chrome is running)")
+    p_chr_copy = p_chrome_sub.add_parser("copy", help="Copy Chrome profile directory")
     p_chr_copy.add_argument("--chrome-profile", default="Default", help="Chrome profile to copy")
-    p_chr_copy.add_argument("--force", action="store_true", help="Force re-copy even if recent copy exists")
+    p_chr_copy.add_argument("--force", action="store_true", help="Force re-copy")
 
     p_chr_list = p_chrome_sub.add_parser("list-copied", help="List copied Chrome profiles")
 
-    p_chr_list_chrome = p_chrome_sub.add_parser("list-chrome", help="List available Chrome profiles on system")
+    p_chr_list_chrome = p_chrome_sub.add_parser("list-chrome", help="List available Chrome profiles")
 
     p_chr_cleanup = p_chrome_sub.add_parser("cleanup", help="Remove old copied profiles")
-    p_chr_cleanup.add_argument("--keep", type=int, default=3, help="Number of recent copies to keep")
-
-    p_chr_open = p_chrome_sub.add_parser("open-with-profile", help="Open browser with copied Chrome profile")
-    p_chr_open.add_argument("--url", required=True, help="URL to open")
-    p_chr_open.add_argument("--chrome-profile", default="Default", help="Chrome profile to use")
-    p_chr_open.add_argument("--profile", default="default", help="Browser-pilot profile for saving")
-    p_chr_open.add_argument("--account", help="Account identifier for cookie storage")
-    p_chr_open.add_argument("--headless", action="store_true", help="Run headless")
-    p_chr_open.add_argument("--force", action="store_true", help="Force re-copy of Chrome profile")
-    p_chr_open.add_argument("--save-cookies", action="store_true", help="Save cookies to database on close")
+    p_chr_cleanup.add_argument("--keep", type=int, default=3, help="Number of copies to keep")
 
     p_chr_check = p_chrome_sub.add_parser("check", help="Check if Chrome has cookies for a site")
     p_chr_check.add_argument("--site", required=True, help="Site to check")
@@ -985,24 +603,40 @@ def build_parser():
     p_hr.add_argument("--id", type=int, required=True, help="Request ID to replay")
     p_hr.add_argument("--output", help="Save response to file")
 
-    # ── dom ──
-    p_dom = subparsers.add_parser("dom", help="DOM operations")
-    p_dom.add_argument("--url", required=True, help="Page URL")
-    p_dom.add_argument("--action", required=True, 
-                      choices=["click", "type", "extract", "screenshot", "find", "hold", "drag", "hover", "scroll", "double_click", "type_human"])
-    p_dom.add_argument("--selector", required=True, help="CSS/XPath selector (or 'page' for scroll)")
-    p_dom.add_argument("--value", help="Value for type/hold/scroll actions")
-    p_dom.add_argument("--target", help="Target selector for drag action")
-    p_dom.add_argument("--offset", help="Offset for drag action (x,y format)")
-    p_dom.add_argument("--direction", choices=["up", "down", "left", "right"], help="Scroll direction")
-    p_dom.add_argument("--profile", default="default", help="Browser profile")
-    p_dom.add_argument("--headless", action="store_true", help="Run headless")
-    p_dom.add_argument("--wait", type=int, default=3, help="Page load wait (seconds)")
-    p_dom.add_argument("--output", help="Output file path")
-    p_dom.add_argument("--keep-open", action="store_true", help="Keep browser open")
+    # ── browse ──
+    p_browse = subparsers.add_parser("browse", help="Playwright browser with cookie persistence")
+    p_browse_sub = p_browse.add_subparsers(dest="browse_action")
+
+    p_br_open = p_browse_sub.add_parser("open", help="Open URL with auto cookie sync")
+    p_br_open.add_argument("--url", required=True, help="URL to open")
+    p_br_open.add_argument("--site", required=True, help="Site name for cookie storage")
+    p_br_open.add_argument("--account", help="Account identifier")
+    p_br_open.add_argument("--headless", action="store_true", help="Run headless")
+    p_br_open.add_argument("--wait", type=float, help="Wait seconds after page load")
+    p_br_open.add_argument("--wait-until", default="load", choices=["load", "domcontentloaded", "networkidle"], help="Wait until event")
+    p_br_open.add_argument("--screenshot", help="Save screenshot to file")
+    p_br_open.add_argument("--snapshot", action="store_true", help="Return accessibility snapshot")
+
+    p_br_extract = p_browse_sub.add_parser("extract", help="Extract data using JavaScript")
+    p_br_extract.add_argument("--url", required=True, help="URL to open")
+    p_br_extract.add_argument("--site", required=True, help="Site name for cookie storage")
+    p_br_extract.add_argument("--script", required=True, help="JavaScript to execute (return value is captured)")
+    p_br_extract.add_argument("--account", help="Account identifier")
+    p_br_extract.add_argument("--headless", action="store_true", default=True, help="Run headless (default)")
+    p_br_extract.add_argument("--wait", type=float, help="Wait seconds before extraction")
+    p_br_extract.add_argument("--output", help="Save extracted data to file")
+
+    p_br_intercept = p_browse_sub.add_parser("intercept-api", help="Intercept API responses")
+    p_br_intercept.add_argument("--url", required=True, help="Page URL to open")
+    p_br_intercept.add_argument("--site", required=True, help="Site name for cookie storage")
+    p_br_intercept.add_argument("--pattern", help="URL regex pattern to match (default: .*)")
+    p_br_intercept.add_argument("--account", help="Account identifier")
+    p_br_intercept.add_argument("--headless", action="store_true", help="Run headless")
+    p_br_intercept.add_argument("--wait", type=int, default=30, help="Listen duration (seconds)")
+    p_br_intercept.add_argument("--output", help="Save results to file")
 
     # ── captcha ──
-    p_captcha = subparsers.add_parser("captcha", help="CAPTCHA recognition")
+    p_captcha = subparsers.add_parser("captcha", help="CAPTCHA recognition and trajectory")
     p_captcha_sub = p_captcha.add_subparsers(dest="captcha_action")
 
     p_cap_check = p_captcha_sub.add_parser("check", help="Check CAPTCHA dependencies")
@@ -1013,31 +647,14 @@ def build_parser():
     p_cap_rec.add_argument("--api-key", help="API key for fallback service")
     p_cap_rec.add_argument("--api-provider", choices=["2captcha", "anticaptcha"], default="2captcha")
 
-    p_cap_img = p_captcha_sub.add_parser("image", help="Recognize CAPTCHA from page element")
-    p_cap_img.add_argument("--url", required=True, help="Page URL")
-    p_cap_img.add_argument("--selector", required=True, help="CAPTCHA image selector")
-    p_cap_img.add_argument("--input-selector", help="Input field to auto-fill result")
-    p_cap_img.add_argument("--profile", default="default", help="Browser profile")
-    p_cap_img.add_argument("--headless", action="store_true", help="Run headless")
-    p_cap_img.add_argument("--wait", type=int, default=3, help="Page load wait")
-    p_cap_img.add_argument("--api-key", help="API key for fallback service")
-    p_cap_img.add_argument("--api-provider", choices=["2captcha", "anticaptcha"], default="2captcha")
+    p_cap_gap = p_captcha_sub.add_parser("find-gap", help="Find gap position in slider CAPTCHA")
+    p_cap_gap.add_argument("--file", required=True, help="Background image file")
+    p_cap_gap.add_argument("--slider-file", help="Slider piece image file (optional)")
 
-    p_cap_slider = p_captcha_sub.add_parser("slider", help="Solve slider CAPTCHA")
-    p_cap_slider.add_argument("--url", required=True, help="Page URL")
-    p_cap_slider.add_argument("--selector", required=True, help="Slider element selector")
-    p_cap_slider.add_argument("--background", help="Background image selector (for gap detection)")
-    p_cap_slider.add_argument("--gap-x", help="Known gap X position (skip detection)")
-    p_cap_slider.add_argument("--profile", default="default", help="Browser profile")
-    p_cap_slider.add_argument("--headless", action="store_true", help="Run headless")
-    p_cap_slider.add_argument("--wait", type=int, default=3, help="Page load wait")
-
-    p_cap_gap = p_captcha_sub.add_parser("find_gap", help="Find gap position in slider CAPTCHA")
-    p_cap_gap.add_argument("--url", required=True, help="Page URL")
-    p_cap_gap.add_argument("--selector", required=True, help="Background image selector")
-    p_cap_gap.add_argument("--profile", default="default", help="Browser profile")
-    p_cap_gap.add_argument("--headless", action="store_true", help="Run headless")
-    p_cap_gap.add_argument("--wait", type=int, default=3, help="Page load wait")
+    p_cap_traj = p_captcha_sub.add_parser("trajectory", help="Generate human-like mouse trajectory")
+    p_cap_traj.add_argument("--distance", type=int, required=True, help="Distance to move (pixels)")
+    p_cap_traj.add_argument("--duration", type=float, default=0.5, help="Duration (seconds)")
+    p_cap_traj.add_argument("--points", type=int, default=20, help="Number of trajectory points")
 
     return parser
 
@@ -1051,14 +668,12 @@ def main():
         sys.exit(1)
 
     commands = {
-        "open": cmd_open,
-        "login": cmd_login,
         "fetch": cmd_fetch,
         "intercept": cmd_intercept,
         "cookies": cmd_cookies,
         "chrome": cmd_chrome,
         "history": cmd_history,
-        "dom": cmd_dom,
+        "browse": cmd_browse,
         "captcha": cmd_captcha,
     }
 

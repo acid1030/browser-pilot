@@ -1,6 +1,10 @@
 """
 Browser Pilot - CAPTCHA Solver
-Image CAPTCHA recognition using ddddocr and slider CAPTCHA automation.
+Image CAPTCHA recognition using ddddocr, slider gap detection via OpenCV,
+and human-like trajectory generation for Playwright integration.
+
+No browser dependency - all operations work on image files/bytes.
+Trajectory output is designed for Playwright's mouse API.
 """
 import base64
 import io
@@ -83,40 +87,6 @@ class CaptchaSolver:
                 return result
         
         return {"success": False, "text": "", "method": "none"}
-    
-    def recognize_image_from_element(self, driver, element) -> dict:
-        """
-        Recognize CAPTCHA from a Selenium element.
-        
-        Args:
-            driver: WebDriver instance
-            element: Selenium element containing CAPTCHA image
-        
-        Returns:
-            dict: {"success": bool, "text": str, "method": str}
-        """
-        try:
-            # Get image as base64 from img element or screenshot
-            tag_name = element.tag_name.lower()
-            
-            if tag_name == "img":
-                # Try to get src attribute
-                src = element.get_attribute("src")
-                if src and src.startswith("data:image"):
-                    # Base64 embedded image
-                    image_data = base64.b64decode(src.split(",")[1])
-                else:
-                    # Take screenshot of element
-                    image_data = element.screenshot_as_png
-            else:
-                # Screenshot element
-                image_data = element.screenshot_as_png
-            
-            return self.recognize_image(image_data)
-            
-        except Exception as e:
-            log.error(f"Failed to get CAPTCHA image: {e}")
-            return {"success": False, "text": "", "method": "error"}
     
     def recognize_image_from_url(self, url: str) -> dict:
         """
@@ -241,76 +211,46 @@ class CaptchaSolver:
         
         return trajectory
     
-    def solve_slider(
+    def generate_trajectory_json(
         self,
-        driver,
-        slider_element,
-        background_element=None,
-        gap_x: int = None,
-        timeout: float = 2.0
+        distance: int,
+        duration: float = 0.5,
+        points: int = 20
     ) -> dict:
         """
-        Solve slider CAPTCHA by dragging slider to gap.
+        Generate human-like trajectory as JSON-serializable data.
+        Designed for Playwright's mouse API: page.mouse.move(x, y).
         
         Args:
-            driver: WebDriver instance
-            slider_element: Draggable slider element
-            background_element: Background image element (for gap detection)
-            gap_x: Known gap X position (if already detected)
-            timeout: Max drag duration
+            distance: Total distance to move (pixels)
+            duration: Total duration (seconds)
+            points: Number of trajectory points
         
         Returns:
-            dict: {"success": bool, "distance": int, "method": str}
+            dict: {
+                "success": True,
+                "distance": int,
+                "duration": float,
+                "points": int,
+                "trajectory": [{"x": int, "y": 0, "delay_ms": int}, ...]
+            }
         """
-        from selenium.webdriver.common.action_chains import ActionChains
+        raw = self.generate_human_trajectory(distance, duration, points)
+        trajectory = []
+        for x, delay in raw:
+            trajectory.append({
+                "x": x,
+                "y": 0,
+                "delay_ms": int(delay * 1000)
+            })
         
-        try:
-            # Detect gap position if not provided
-            if gap_x is None and background_element:
-                bg_image = background_element.screenshot_as_png
-                gap_result = self.find_slider_gap(bg_image)
-                
-                if gap_result["success"]:
-                    gap_x = gap_result["x"]
-                else:
-                    return {"success": False, "distance": 0, "method": "gap_detection_failed"}
-            
-            if gap_x is None:
-                return {"success": False, "distance": 0, "method": "no_gap_position"}
-            
-            # Calculate distance to move (gap_x minus slider starting position)
-            slider_x = slider_element.location["x"]
-            distance = gap_x - slider_x
-            
-            if distance <= 0:
-                # Gap might be relative to background, try using gap_x directly
-                distance = gap_x
-            
-            # Generate human-like trajectory
-            trajectory = self.generate_human_trajectory(distance, timeout * 0.8)
-            
-            # Perform drag
-            actions = ActionChains(driver)
-            actions.click_and_hold(slider_element)
-            
-            last_x = 0
-            for x, delay in trajectory:
-                move_x = x - last_x
-                if move_x != 0:
-                    actions.move_by_offset(move_x, random.randint(-1, 1))
-                last_x = x
-            
-            actions.release()
-            actions.perform()
-            
-            # Brief pause to let page process
-            time.sleep(0.3)
-            
-            return {"success": True, "distance": distance, "method": "drag_completed"}
-            
-        except Exception as e:
-            log.error(f"Slider solve failed: {e}")
-            return {"success": False, "distance": 0, "method": f"error: {e}"}
+        return {
+            "success": True,
+            "distance": distance,
+            "duration": duration,
+            "points": len(trajectory),
+            "trajectory": trajectory
+        }
     
     def _call_api_ocr(self, image_data: bytes) -> dict:
         """Call third-party OCR API as fallback."""
@@ -426,14 +366,14 @@ def recognize(image_data: bytes) -> dict:
     return get_solver().recognize_image(image_data)
 
 
-def solve_slider(driver, slider_element, background_element=None, gap_x: int = None) -> dict:
-    """Solve slider CAPTCHA."""
-    return get_solver().solve_slider(driver, slider_element, background_element, gap_x)
-
-
 def find_gap(background_image: bytes, slider_image: bytes = None) -> dict:
     """Find gap position in slider CAPTCHA."""
     return get_solver().find_slider_gap(background_image, slider_image)
+
+
+def generate_trajectory(distance: int, duration: float = 0.5, points: int = 20) -> dict:
+    """Generate human-like trajectory as JSON data for Playwright mouse API."""
+    return get_solver().generate_trajectory_json(distance, duration, points)
 
 
 def check_dependencies() -> dict:
