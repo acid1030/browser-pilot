@@ -1,11 +1,11 @@
 ---
 name: browser-pilot
-description: "Selenium-based browser automation with CDP interception, cookie persistence, and auto-login detection. Use as the primary browser tool for web scraping, form automation, data extraction, and authenticated browsing. Preferred over Playwright for sites requiring CDP interception or persistent cookie sessions."
+description: "Selenium-based browser automation with CDP interception, cookie persistence, multi-account support, and CAPTCHA solving. Use as the primary browser tool for web scraping, form automation, data extraction, and authenticated multi-account browsing. Preferred over Playwright for sites requiring CDP interception, persistent cookie sessions, or CAPTCHA handling."
 ---
 
 # Browser Pilot
 
-Selenium + ChromeDriver browser automation skill with CDP network interception, cookie persistence to SQLite, and auto-login detection.
+Selenium + ChromeDriver browser automation skill with CDP network interception, multi-account cookie persistence, smart cookie loading, enhanced DOM operations, and CAPTCHA recognition.
 
 ## When to Use
 
@@ -18,10 +18,12 @@ Selenium + ChromeDriver browser automation skill with CDP network interception, 
 - User asks to operate/automate a browser
 - User needs to scrape/extract data from a website
 - User needs to login to a website and save credentials
+- User specifies an account name/identifier for multi-account workflows
 - User needs to intercept XHR/Fetch API requests
 - User needs to make HTTP requests with stored cookies
-- User needs to click, type, or interact with web page elements
+- User needs to click, type, drag, hover, or interact with web page elements
 - User asks to monitor network requests from a page
+- User needs to solve image/slider CAPTCHA
 
 ## CLI Reference
 
@@ -32,27 +34,28 @@ python ~/.qoder/skills/browser-pilot/browser_pilot.py <command> [options]
 
 ### open - Open browser to URL
 ```bash
-python browser_pilot.py open --url URL [--profile NAME] [--headless] [--wait-login]
-  [--check-url URL] [--check-selector SEL] [--timeout 300]
+python browser_pilot.py open --url URL [--profile NAME] [--account ACCOUNT]
+  [--headless] [--wait-login] [--smart-cookies] [--validate-url URL]
+  [--chrome-profile NAME] [--check-url URL] [--check-selector SEL] [--timeout 300]
 ```
-Opens a browser with stored cookies (if available). Use `--wait-login` to poll every 5s for login detection.
+Opens a browser with stored cookies. Use `--account` to specify which account's cookies to use. Use `--smart-cookies` for intelligent cookie loading with Chrome fallback.
 
 ### login - Login flow
 ```bash
 # Auto-login with credentials
-python browser_pilot.py login --url URL --username USER --password PASS [--profile NAME]
-  [--check-url URL] [--check-selector SEL]
+python browser_pilot.py login --url URL --username USER --password PASS
+  [--account ACCOUNT] [--profile NAME] [--check-url URL] [--check-selector SEL]
 
 # Manual login (opens browser, waits for you to login)
-python browser_pilot.py login --url URL [--profile NAME] [--timeout 300]
+python browser_pilot.py login --url URL [--account ACCOUNT] [--profile NAME] [--timeout 300]
 ```
-After login detection, cookies are automatically saved to database.
+After login detection, cookies are automatically saved to database under the specified account.
 
 ### fetch - Fetch data
 ```bash
 # Direct HTTP (fast, no browser)
 python browser_pilot.py fetch --url URL [--method GET] [--use-cookies SITE]
-  [--headers JSON] [--data JSON] [--output FILE]
+  [--account ACCOUNT] [--headers JSON] [--data JSON] [--output FILE]
 
 # CDP interception (browser-based)
 python browser_pilot.py fetch --url URL --cdp [--pattern REGEX] [--wait 15] [--output FILE]
@@ -67,11 +70,13 @@ Loads a page and captures all network requests matching the URL pattern.
 
 ### cookies - Cookie management
 ```bash
-python browser_pilot.py cookies list [--site SITE]
-python browser_pilot.py cookies export --site SITE [--format json|header]
-python browser_pilot.py cookies import --site SITE --file FILE
-python browser_pilot.py cookies delete --site SITE
-python browser_pilot.py cookies check --site SITE --url URL
+python browser_pilot.py cookies list [--site SITE] [--account ACCOUNT]
+python browser_pilot.py cookies export --site SITE [--account ACCOUNT] [--format json|header]
+python browser_pilot.py cookies import --site SITE --file FILE [--account ACCOUNT]
+python browser_pilot.py cookies delete --site SITE [--account ACCOUNT]
+python browser_pilot.py cookies check --site SITE --url URL [--account ACCOUNT]
+python browser_pilot.py cookies chrome --site SITE [--account ACCOUNT] [--chrome-profile Default]
+python browser_pilot.py cookies profiles
 ```
 
 ### history - Request history
@@ -82,33 +87,105 @@ python browser_pilot.py history replay --id ID [--output FILE]
 
 ### dom - DOM operations
 ```bash
-python browser_pilot.py dom --url URL --action click|type|extract|screenshot
-  --selector SELECTOR [--value VALUE] [--profile NAME] [--output FILE]
+python browser_pilot.py dom --url URL --action ACTION --selector SELECTOR
+  [--value VALUE] [--target TARGET] [--offset X,Y] [--direction up|down|left|right]
+  [--profile NAME] [--output FILE]
+```
+
+**Actions:**
+| Action | Description |
+|--------|-------------|
+| `click` | Click element |
+| `double_click` | Double click element |
+| `type` | Type text into element |
+| `type_human` | Type with human-like delays |
+| `extract` | Extract text/HTML from elements |
+| `screenshot` | Take page screenshot |
+| `find` | Find element (returns info) |
+| `hold` | Click and hold for duration |
+| `drag` | Drag to target or by offset |
+| `hover` | Hover over element |
+| `scroll` | Scroll page or to element |
+
+### captcha - CAPTCHA recognition
+```bash
+# Check dependencies
+python browser_pilot.py captcha check
+
+# Recognize image CAPTCHA
+python browser_pilot.py captcha recognize --file IMAGE.png
+python browser_pilot.py captcha image --url URL --selector "#captcha-img" [--input-selector "#input"]
+
+# Solve slider CAPTCHA
+python browser_pilot.py captcha slider --url URL --selector ".slider" [--background ".bg"]
+python browser_pilot.py captcha find_gap --url URL --selector ".background"
+```
+
+## Multi-Account Workflow
+
+When user specifies an account (e.g., "use account user1@example.com"), use the `--account` parameter:
+
+```bash
+# Login and save cookies for specific account
+python browser_pilot.py login --url https://example.com/login \
+  --account "user1@example.com" --check-selector ".avatar"
+
+# Open with specific account's cookies
+python browser_pilot.py open --url https://example.com \
+  --account "user1@example.com" --smart-cookies
+
+# List cookies for specific account
+python browser_pilot.py cookies list --account "user1@example.com"
+```
+
+## Smart Cookie Loading
+
+Use `--smart-cookies` for intelligent cookie loading chain:
+1. **Database** → Load stored cookies
+2. **Validate** → HTTP test if `--validate-url` provided
+3. **Chrome Import** → Import from local Chrome if invalid/missing
+
+```bash
+python browser_pilot.py open --url https://example.com \
+  --smart-cookies --validate-url https://example.com/api/me \
+  --chrome-profile "Profile 1"
 ```
 
 ## Typical Workflow
 
-### Scenario: Scrape data from authenticated site
+### Scenario: Multi-account scraping
 
 ```bash
-# Step 1: Login and save cookies (manual)
+# Step 1: Login Account 1
 python browser_pilot.py login --url https://shop.example.com/login \
-  --check-selector ".user-avatar" --profile myshop
+  --account "account1@gmail.com" --check-selector ".user-avatar"
 
-# Step 2: Verify cookies are valid
-python browser_pilot.py cookies check --site shop.example.com \
-  --url https://shop.example.com/api/user
+# Step 2: Login Account 2
+python browser_pilot.py login --url https://shop.example.com/login \
+  --account "account2@gmail.com" --check-selector ".user-avatar"
 
-# Step 3: Intercept API responses via CDP
-python browser_pilot.py intercept --url https://shop.example.com/orders \
-  --pattern "api/order" --wait 10 --output orders.json --profile myshop
+# Step 3: Fetch data with Account 1
+python browser_pilot.py fetch --url "https://shop.example.com/api/orders" \
+  --use-cookies shop.example.com --account "account1@gmail.com"
 
-# Step 4: Direct HTTP for subsequent pages (faster, no browser)
-python browser_pilot.py fetch --url "https://shop.example.com/api/orders?page=2" \
-  --use-cookies shop.example.com --output page2.json
+# Step 4: Fetch data with Account 2
+python browser_pilot.py fetch --url "https://shop.example.com/api/orders" \
+  --use-cookies shop.example.com --account "account2@gmail.com"
+```
 
-# Step 5: Replay a previous request
-python browser_pilot.py history replay --id 3 --output replay.json
+### Scenario: CAPTCHA handling
+
+```bash
+# Open page with CAPTCHA
+python browser_pilot.py open --url https://example.com/login --wait-login
+
+# If image CAPTCHA detected
+python browser_pilot.py captcha image --url https://example.com/login \
+  --selector "#captcha-img" --input-selector "#captcha-input"
+
+# If slider CAPTCHA detected
+python browser_pilot.py captcha slider --url https://example.com/login \
+  --selector ".slider-btn" --background ".slider-bg"
 ```
 
 ## Login Detection Logic
@@ -121,13 +198,16 @@ When `--wait-login` or `login` command is used, the tool polls every 5 seconds u
 
 ## Data Storage
 
-- **Database**: `~/.qoder/browser-pilot/browser_pilot.db` (SQLite)
+- **Database**: `~/.qoder/browser-pilot/browser_pilot.db` (SQLite) or MySQL
 - **Chrome profiles**: `~/.qoder/browser-pilot/chrome-profiles/{profile_name}/`
 - **Tables**: `cookie_stores`, `request_history`, `login_states`
+- **Account field**: Cookies stored as `(site, account)` unique key
 
 ## Key Principles
 
-- Always save cookies after successful login
+- Always use `--account` when user specifies account name/identifier
+- Use `--smart-cookies` for intelligent cookie loading with fallbacks
+- Save cookies after successful login
 - Use stored cookies for direct HTTP requests when possible (faster than browser)
 - Record all requests to history for replay capability
 - Isolate browser profiles per site/account
