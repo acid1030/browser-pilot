@@ -36,9 +36,10 @@ python ~/.qoder/skills/browser-pilot/browser_pilot.py <command> [options]
 ```bash
 python browser_pilot.py open --url URL [--profile NAME] [--account ACCOUNT]
   [--headless] [--wait-login] [--smart-cookies] [--validate-url URL]
-  [--chrome-profile NAME] [--check-url URL] [--check-selector SEL] [--timeout 300]
+  [--chrome-profile NAME] [--use-chrome-profile] [--force-copy]
+  [--check-url URL] [--check-selector SEL] [--timeout 300]
 ```
-Opens a browser with stored cookies. Use `--account` to specify which account's cookies to use. Use `--smart-cookies` for intelligent cookie loading with Chrome fallback.
+Opens a browser with stored cookies. Use `--account` to specify which account's cookies to use. Use `--smart-cookies` for intelligent cookie loading with Chrome fallback. Use `--use-chrome-profile` to copy and use Chrome profile directly (works even when Chrome is running).
 
 ### login - Login flow
 ```bash
@@ -77,6 +78,28 @@ python browser_pilot.py cookies delete --site SITE [--account ACCOUNT]
 python browser_pilot.py cookies check --site SITE --url URL [--account ACCOUNT]
 python browser_pilot.py cookies chrome --site SITE [--account ACCOUNT] [--chrome-profile Default]
 python browser_pilot.py cookies profiles
+```
+
+### chrome - Chrome profile management
+```bash
+# Copy Chrome profile (works when Chrome is running)
+python browser_pilot.py chrome copy [--chrome-profile Default] [--force]
+
+# List copied profiles
+python browser_pilot.py chrome list-copied
+
+# List available Chrome profiles
+python browser_pilot.py chrome list-chrome
+
+# Clean up old copied profiles
+python browser_pilot.py chrome cleanup [--keep 3]
+
+# Open browser with copied Chrome profile
+python browser_pilot.py chrome open-with-profile --url URL [--chrome-profile Default]
+  [--profile NAME] [--account ACCOUNT] [--headless] [--force] [--save-cookies]
+
+# Check if Chrome has cookies for a site
+python browser_pilot.py chrome check --site SITE [--chrome-profile Default]
 ```
 
 ### history - Request history
@@ -151,6 +174,30 @@ python browser_pilot.py open --url https://example.com \
   --chrome-profile "Profile 1"
 ```
 
+## Chrome Profile Copying (v2.1)
+
+**Problem**: When Chrome is running, its Cookie SQLite file is locked and cannot be read.
+
+**Solution**: Copy the Chrome profile directory instead of reading the Cookie file directly. This is similar to Playwright's persistent context approach.
+
+```bash
+# Copy Chrome profile (works when Chrome is running!)
+python browser_pilot.py chrome copy --chrome-profile Default
+
+# Open browser with copied Chrome profile (inherits all cookies/sessions)
+python browser_pilot.py open --url https://example.com --use-chrome-profile
+
+# Or use the chrome command directly
+python browser_pilot.py chrome open-with-profile --url https://example.com \
+  --chrome-profile Default --save-cookies
+```
+
+**Key Benefits:**
+- Works even when Chrome is running
+- Inherits all cookies, sessions, local storage, indexed DB
+- No need to manually export/import cookies
+- Profile is isolated - changes don't affect original Chrome
+
 ## Typical Workflow
 
 ### Scenario: Multi-account scraping
@@ -200,6 +247,7 @@ When `--wait-login` or `login` command is used, the tool polls every 5 seconds u
 
 - **Database**: `~/.qoder/browser-pilot/browser_pilot.db` (SQLite) or MySQL
 - **Chrome profiles**: `~/.qoder/browser-pilot/chrome-profiles/{profile_name}/`
+- **Copied Chrome profiles**: `~/.qoder/browser-pilot/chrome-imports/{name}/`
 - **Tables**: `cookie_stores`, `request_history`, `login_states`
 - **Account field**: Cookies stored as `(site, account)` unique key
 

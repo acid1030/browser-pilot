@@ -1,10 +1,12 @@
 """
 Browser Pilot - Selenium/CDP Driver Factory
 Creates WebDriver instances with anti-detection, CDP support, and profile isolation.
+Supports using copied Chrome profiles for inheriting cookies/sessions.
 """
 import json
 import logging
 from pathlib import Path
+from typing import Optional
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -13,6 +15,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 log = logging.getLogger("browser-pilot")
 
+# Default profiles directory for browser-pilot isolated profiles
 PROFILES_DIR = Path.home() / ".qoder" / "browser-pilot" / "chrome-profiles"
 
 STEALTH_JS = """
@@ -23,12 +26,26 @@ window.chrome = {runtime: {}};
 """
 
 
-def create_driver(profile="default", headless=False, enable_perf_log=True):
-    """Create a ChromeDriver with anti-detection and optional CDP logging."""
-    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
-    profile_dir = PROFILES_DIR / profile
-    profile_dir.mkdir(parents=True, exist_ok=True)
-
+def create_driver(
+    profile: str = "default",
+    headless: bool = False,
+    enable_perf_log: bool = True,
+    chrome_profile_path: Optional[str] = None
+):
+    """
+    Create a ChromeDriver with anti-detection and optional CDP logging.
+    
+    Args:
+        profile: Browser-pilot profile name (for isolated storage)
+        headless: Run in headless mode
+        enable_perf_log: Enable CDP performance logging
+        chrome_profile_path: Path to a copied Chrome profile directory.
+                            If provided, uses this instead of creating a new profile.
+                            This should be a full user-data-dir path from copy_chrome_profile_full().
+    
+    Returns:
+        WebDriver instance
+    """
     options = Options()
 
     # Anti-detection
@@ -36,8 +53,26 @@ def create_driver(profile="default", headless=False, enable_perf_log=True):
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
-    # Profile isolation
-    options.add_argument(f"--user-data-dir={profile_dir}")
+    # Profile handling
+    if chrome_profile_path:
+        # Use copied Chrome profile (inherits cookies, sessions, etc.)
+        user_data_dir = Path(chrome_profile_path)
+        if not user_data_dir.exists():
+            log.warning(f"Chrome profile path not found: {chrome_profile_path}")
+            # Fall back to default profile
+            PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+            profile_dir = PROFILES_DIR / profile
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            options.add_argument(f"--user-data-dir={profile_dir}")
+        else:
+            log.info(f"Using copied Chrome profile: {chrome_profile_path}")
+            options.add_argument(f"--user-data-dir={user_data_dir}")
+    else:
+        # Use browser-pilot's isolated profile
+        PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        profile_dir = PROFILES_DIR / profile
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        options.add_argument(f"--user-data-dir={profile_dir}")
 
     # Common settings
     options.add_argument("--no-first-run")
@@ -70,6 +105,62 @@ def create_driver(profile="default", headless=False, enable_perf_log=True):
         execute_cdp(driver, "Page.enable", {})
 
     return driver
+
+
+def create_driver_with_chrome_profile(
+    chrome_profile: str = "Default",
+    headless: bool = False,
+    enable_perf_log: bool = True,
+    force_copy: bool = False
+):
+    """
+    Create a driver using a copied Chrome profile.
+    This copies the Chrome profile first, then launches with that profile.
+    Works even when Chrome is running (like Playwright persistent context).
+    
+    Args:
+        chrome_profile: Name of Chrome profile to copy (Default, Profile 1, etc.)
+        headless: Run in headless mode
+        enable_perf_log: Enable CDP performance logging
+        force_copy: Force re-copy of profile even if recent copy exists
+    
+    Returns:
+        tuple: (WebDriver, profile_path) or (None, error_message)
+    """
+    import chrome_cookies
+    
+    # Check for existing recent copy if not forcing
+    if not force_copy:
+        existing = chrome_cookies.get_latest_copied_profile(chrome_profile)
+        if existing:
+            log.info(f"Using existing profile copy: {existing}")
+            driver = create_driver(
+                chrome_profile_path=existing,
+                headless=headless,
+                enable_perf_log=enable_perf_log
+            )
+            return driver, existing
+    
+    # Copy Chrome profile
+    result = chrome_cookies.copy_chrome_profile_full(
+        chrome_profile=chrome_profile,
+        force=force_copy
+    )
+    
+    if not result["success"]:
+        log.error(f"Failed to copy Chrome profile: {result['message']}")
+        return None, result["message"]
+    
+    profile_path = result["path"]
+    
+    # Create driver with copied profile
+    driver = create_driver(
+        chrome_profile_path=profile_path,
+        headless=headless,
+        enable_perf_log=enable_perf_log
+    )
+    
+    return driver, profile_path
 
 
 def inject_stealth_js(driver):

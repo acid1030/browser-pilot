@@ -13,6 +13,7 @@ Commands:
     fetch      Fetch data via HTTP or CDP
     intercept  CDP network request interception
     cookies    Cookie management (list/export/import/delete/check/chrome)
+    chrome     Chrome profile management (copy/list-copied/cleanup/open-with-profile)
     history    Request history (list/replay)
     dom        DOM operations (click/type/extract/screenshot/find/hold/drag/hover/scroll)
     captcha    CAPTCHA recognition (image/slider)
@@ -62,9 +63,53 @@ def cmd_open(args):
     """Open browser to URL with smart cookie loading (DB -> validate -> Chrome)."""
     driver = None
     try:
-        driver = drv.create_driver(profile=args.profile, headless=args.headless)
         site = cm.extract_site(args.url)
         account = getattr(args, 'account', None)
+        
+        # Option 1: Use copied Chrome profile directly (works when Chrome is running)
+        if args.use_chrome_profile:
+            log.info(f"Opening with Chrome profile: {args.chrome_profile or 'Default'}")
+            driver, profile_path = drv.create_driver_with_chrome_profile(
+                chrome_profile=args.chrome_profile or "Default",
+                headless=args.headless,
+                force_copy=args.force_copy
+            )
+            if not driver:
+                output_error(f"Failed to copy Chrome profile: {profile_path}")
+                return
+            
+            driver.get(args.url)
+            log.info(f"Opened {args.url} with Chrome profile (inherits all cookies/sessions)")
+            
+            if args.wait_login:
+                success = cm.wait_for_login(
+                    driver,
+                    check_url=args.check_url,
+                    check_selector=args.check_selector,
+                    timeout=args.timeout,
+                )
+                if success:
+                    count = cm.save_from_driver(driver, site, args.profile, account=account)
+                    db.update_login_state(site, True, args.check_url, args.check_selector, account=account)
+                    output_json({"message": f"Login detected, saved {count} cookies", "site": site, "account": account})
+                else:
+                    output_json({"message": "Login timeout"}, success=False)
+            else:
+                output_json({
+                    "message": f"Browser opened at {args.url}",
+                    "site": site,
+                    "account": account,
+                    "chrome_profile_path": profile_path,
+                    "cookies": {"source": "chrome_profile", "count": "inherited", "valid": True}
+                })
+                try:
+                    input("Press Enter to close browser...")
+                except (EOFError, KeyboardInterrupt):
+                    pass
+            return
+        
+        # Option 2: Standard browser-pilot profile
+        driver = drv.create_driver(profile=args.profile, headless=args.headless)
 
         # Smart cookie loading with validation and Chrome fallback
         if args.smart_cookies:
@@ -413,6 +458,99 @@ def cmd_cookies(args):
         output_error(e)
 
 
+# ─── Command: chrome ───
+
+def cmd_chrome(args):
+    """Chrome profile management - copy, list, cleanup, open with copied profile."""
+    import chrome_cookies
+    
+    try:
+        action = args.chrome_action
+        
+        if action == "copy":
+            # Copy Chrome profile directory (works even when Chrome is running)
+            result = chrome_cookies.copy_chrome_profile_full(
+                chrome_profile=args.chrome_profile or "Default",
+                force=args.force
+            )
+            output_json(result)
+        
+        elif action == "list-copied":
+            # List all copied Chrome profiles
+            profiles = chrome_cookies.get_copied_profiles()
+            output_json({"copied_profiles": profiles})
+        
+        elif action == "list-chrome":
+            # List available Chrome profiles on system
+            profiles = chrome_cookies.list_chrome_profiles()
+            output_json({"chrome_profiles": profiles})
+        
+        elif action == "cleanup":
+            # Clean up old copied profiles
+            keep = args.keep or 3
+            removed = chrome_cookies.cleanup_old_profiles(keep_count=keep)
+            output_json({"message": f"Removed {removed} old profile copies", "kept": keep})
+        
+        elif action == "open-with-profile":
+            # Open browser using copied Chrome profile
+            if not args.url:
+                output_error("--url is required")
+                return
+            
+            driver, profile_path = drv.create_driver_with_chrome_profile(
+                chrome_profile=args.chrome_profile or "Default",
+                headless=args.headless,
+                force_copy=args.force
+            )
+            
+            if not driver:
+                output_error(f"Failed to create driver: {profile_path}")
+                return
+            
+            try:
+                driver.get(args.url)
+                site = cm.extract_site(args.url)
+                
+                output_json({
+                    "message": f"Browser opened with Chrome profile",
+                    "url": args.url,
+                    "profile_path": profile_path,
+                    "site": site
+                })
+                
+                try:
+                    input("Press Enter to close browser...")
+                except (EOFError, KeyboardInterrupt):
+                    pass
+                
+                # Optionally save cookies to database
+                if args.save_cookies:
+                    account = getattr(args, 'account', None)
+                    count = cm.save_from_driver(driver, site, args.profile or "default", account=account)
+                    log.info(f"Saved {count} cookies for {site}")
+                    
+            finally:
+                drv.close_driver(driver)
+        
+        elif action == "check":
+            # Check if Chrome has cookies for a site
+            if not args.site:
+                output_error("--site is required")
+                return
+            has_cookies = chrome_cookies.has_chrome_cookies(args.site, args.chrome_profile or "Default")
+            output_json({
+                "site": args.site,
+                "has_cookies": has_cookies,
+                "chrome_profile": args.chrome_profile or "Default"
+            })
+        
+        else:
+            output_json({"error": f"Unknown chrome action: {action}"}, success=False)
+    
+    except Exception as e:
+        output_error(e)
+
+
 # ─── Command: history ───
 
 def cmd_history(args):
@@ -731,6 +869,9 @@ def build_parser():
     p_open.add_argument("--smart-cookies", action="store_true", help="Enable smart cookie loading (DB -> validate -> Chrome)")
     p_open.add_argument("--validate-url", help="URL to validate cookies (for smart loading)")
     p_open.add_argument("--chrome-profile", help="Chrome profile name for cookie import (default: Default)")
+    p_open.add_argument("--use-chrome-profile", action="store_true", 
+                       help="Copy and use Chrome profile directly (works when Chrome is running)")
+    p_open.add_argument("--force-copy", action="store_true", help="Force re-copy Chrome profile")
 
     # ── login ──
     p_login = subparsers.add_parser("login", help="Handle login flow")
@@ -803,6 +944,34 @@ def build_parser():
     p_cchr.add_argument("--account", help="Account identifier to save under")
 
     p_cprof = p_cookies_sub.add_parser("profiles", help="List Chrome profiles")
+
+    # ── chrome ──
+    p_chrome = subparsers.add_parser("chrome", help="Chrome profile management")
+    p_chrome_sub = p_chrome.add_subparsers(dest="chrome_action")
+
+    p_chr_copy = p_chrome_sub.add_parser("copy", help="Copy Chrome profile directory (works when Chrome is running)")
+    p_chr_copy.add_argument("--chrome-profile", default="Default", help="Chrome profile to copy")
+    p_chr_copy.add_argument("--force", action="store_true", help="Force re-copy even if recent copy exists")
+
+    p_chr_list = p_chrome_sub.add_parser("list-copied", help="List copied Chrome profiles")
+
+    p_chr_list_chrome = p_chrome_sub.add_parser("list-chrome", help="List available Chrome profiles on system")
+
+    p_chr_cleanup = p_chrome_sub.add_parser("cleanup", help="Remove old copied profiles")
+    p_chr_cleanup.add_argument("--keep", type=int, default=3, help="Number of recent copies to keep")
+
+    p_chr_open = p_chrome_sub.add_parser("open-with-profile", help="Open browser with copied Chrome profile")
+    p_chr_open.add_argument("--url", required=True, help="URL to open")
+    p_chr_open.add_argument("--chrome-profile", default="Default", help="Chrome profile to use")
+    p_chr_open.add_argument("--profile", default="default", help="Browser-pilot profile for saving")
+    p_chr_open.add_argument("--account", help="Account identifier for cookie storage")
+    p_chr_open.add_argument("--headless", action="store_true", help="Run headless")
+    p_chr_open.add_argument("--force", action="store_true", help="Force re-copy of Chrome profile")
+    p_chr_open.add_argument("--save-cookies", action="store_true", help="Save cookies to database on close")
+
+    p_chr_check = p_chrome_sub.add_parser("check", help="Check if Chrome has cookies for a site")
+    p_chr_check.add_argument("--site", required=True, help="Site to check")
+    p_chr_check.add_argument("--chrome-profile", default="Default", help="Chrome profile to check")
 
     # ── history ──
     p_history = subparsers.add_parser("history", help="Request history")
@@ -887,6 +1056,7 @@ def main():
         "fetch": cmd_fetch,
         "intercept": cmd_intercept,
         "cookies": cmd_cookies,
+        "chrome": cmd_chrome,
         "history": cmd_history,
         "dom": cmd_dom,
         "captcha": cmd_captcha,
