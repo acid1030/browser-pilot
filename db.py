@@ -1,6 +1,7 @@
 """
 Browser Pilot - Database Layer
 Thin delegation layer that auto-detects MySQL or falls back to SQLite.
+Supports account-based cookie storage for multi-account scenarios.
 
 Configuration priority:
 1. Environment variables: BROWSER_PILOT_DB=mysql + BROWSER_PILOT_MYSQL_*
@@ -78,28 +79,34 @@ def _get_backend():
 
 # ─── Public API (delegate to backend) ───
 
-def save_cookies(site, profile, cookies_list, user_agent=None):
-    return _get_backend().save_cookies(site, profile, cookies_list, user_agent)
+def save_cookies(site, profile, cookies_list, user_agent=None, account=None):
+    """Save cookies with optional account identifier."""
+    return _get_backend().save_cookies(site, profile, cookies_list, user_agent, account)
 
 
-def load_cookies(site):
-    return _get_backend().load_cookies(site)
+def load_cookies(site, account=None):
+    """Load cookies, optionally filtered by account."""
+    return _get_backend().load_cookies(site, account)
 
 
-def list_cookie_sites():
-    return _get_backend().list_cookie_sites()
+def list_cookie_sites(account=None):
+    """List all sites with stored cookies, optionally filtered by account."""
+    return _get_backend().list_cookie_sites(account)
 
 
-def delete_cookies(site):
-    return _get_backend().delete_cookies(site)
+def delete_cookies(site, account=None):
+    """Delete cookies for site, optionally filtered by account."""
+    return _get_backend().delete_cookies(site, account)
 
 
-def update_cookie_validity(site, is_valid):
-    return _get_backend().update_cookie_validity(site, is_valid)
+def update_cookie_validity(site, is_valid, account=None):
+    """Update validity status for site cookies."""
+    return _get_backend().update_cookie_validity(site, is_valid, account)
 
 
-def get_cookie_store(site):
-    return _get_backend().get_cookie_store(site)
+def get_cookie_store(site, account=None):
+    """Get full cookie store record."""
+    return _get_backend().get_cookie_store(site, account)
 
 
 def save_request(url, method="GET", headers=None, body=None,
@@ -116,9 +123,11 @@ def get_request(req_id):
     return _get_backend().get_request(req_id)
 
 
-def update_login_state(site, is_logged_in, check_url=None, check_selector=None):
-    return _get_backend().update_login_state(site, is_logged_in, check_url, check_selector)
+def update_login_state(site, is_logged_in, check_url=None, check_selector=None, account=None):
+    """Update login state with optional account."""
+    return _get_backend().update_login_state(site, is_logged_in, check_url, check_selector, account)
 
 
-def get_login_state(site):
-    return _get_backend().get_login_state(site)
+def get_login_state(site, account=None):
+    """Get login state, optionally filtered by account."""
+    return _get_backend().get_login_state(site, account)

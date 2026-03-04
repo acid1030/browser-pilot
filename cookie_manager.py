@@ -1,6 +1,8 @@
 """
 Browser Pilot - Cookie Manager
 Handles cookie serialization between Selenium driver, SQLite, and requests.Session.
+Supports intelligent cookie loading: database -> validate -> Chrome import.
+Supports account-based cookie storage for multi-account scenarios.
 """
 import json
 import re
@@ -10,6 +12,7 @@ from urllib.parse import urlparse
 
 import db
 from driver import get_user_agent
+import chrome_cookies
 
 log = logging.getLogger("browser-pilot")
 
@@ -24,8 +27,8 @@ def extract_site(url):
     return host
 
 
-def save_from_driver(driver, site=None, profile="default"):
-    """Save browser cookies to database."""
+def save_from_driver(driver, site=None, profile="default", account=None):
+    """Save browser cookies to database with optional account identifier."""
     if site is None:
         site = extract_site(driver.current_url)
 
@@ -48,16 +51,16 @@ def save_from_driver(driver, site=None, profile="default"):
         clean_cookies.append(cookie)
 
     ua = get_user_agent(driver)
-    db.save_cookies(site, profile, clean_cookies, ua)
-    log.info(f"Saved {len(clean_cookies)} cookies for {site}")
+    db.save_cookies(site, profile, clean_cookies, ua, account=account)
+    log.info(f"Saved {len(clean_cookies)} cookies for {site}" + (f" (account: {account})" if account else ""))
     return len(clean_cookies)
 
 
-def load_to_driver(driver, site, target_url=None):
-    """Load stored cookies into browser driver."""
-    cookies = db.load_cookies(site)
+def load_to_driver(driver, site, target_url=None, account=None):
+    """Load stored cookies into browser driver, optionally filtered by account."""
+    cookies = db.load_cookies(site, account=account)
     if not cookies:
-        log.warning(f"No stored cookies for {site}")
+        log.warning(f"No stored cookies for {site}" + (f" (account: {account})" if account else ""))
         return 0
 
     # Must navigate to the domain first
@@ -80,13 +83,13 @@ def load_to_driver(driver, site, target_url=None):
         except Exception as e:
             log.debug(f"Failed to add cookie {cookie.get('name')}: {e}")
 
-    log.info(f"Loaded {count}/{len(cookies)} cookies for {site}")
+    log.info(f"Loaded {count}/{len(cookies)} cookies for {site}" + (f" (account: {account})" if account else ""))
     return count
 
 
-def load_to_requests_session(session, site):
+def load_to_requests_session(session, site, account=None):
     """Inject stored cookies into a requests.Session."""
-    cookies = db.load_cookies(site)
+    cookies = db.load_cookies(site, account=account)
     if not cookies:
         return 0
 
@@ -99,31 +102,31 @@ def load_to_requests_session(session, site):
         )
 
     # Also set user agent if available
-    store = db.get_cookie_store(site)
+    store = db.get_cookie_store(site, account=account)
     if store and store.get("user_agent"):
         session.headers["User-Agent"] = store["user_agent"]
 
     return len(cookies)
 
 
-def cookies_as_header_string(site):
+def cookies_as_header_string(site, account=None):
     """Format stored cookies as a Cookie header string."""
-    cookies = db.load_cookies(site)
+    cookies = db.load_cookies(site, account=account)
     if not cookies:
         return ""
     return "; ".join(f"{c['name']}={c['value']}" for c in cookies)
 
 
-def check_validity(site, check_url):
+def check_validity(site, check_url, account=None):
     """Check if stored cookies are still valid by making an HTTP request."""
     import requests as req
 
-    cookies = db.load_cookies(site)
+    cookies = db.load_cookies(site, account=account)
     if not cookies:
         return False
 
     session = req.Session()
-    load_to_requests_session(session, site)
+    load_to_requests_session(session, site, account=account)
 
     try:
         resp = session.get(check_url, timeout=15, allow_redirects=False)
@@ -132,11 +135,11 @@ def check_validity(site, check_url):
             resp.status_code == 200
             and "login" not in resp.headers.get("Location", "").lower()
         )
-        db.update_cookie_validity(site, is_valid)
+        db.update_cookie_validity(site, is_valid, account=account)
         return is_valid
     except Exception as e:
         log.warning(f"Cookie validity check failed for {site}: {e}")
-        db.update_cookie_validity(site, False)
+        db.update_cookie_validity(site, False, account=account)
         return False
 
 
@@ -200,3 +203,161 @@ def wait_for_login(driver, check_url=None, check_selector=None, timeout=300, int
 
     print(f"\nLogin detection timed out after {timeout}s")
     return False
+
+
+def validate_cookies(site, test_url, method="GET", account=None):
+    """
+    Validate stored cookies by making an HTTP request.
+    
+    Args:
+        site: Domain/site key
+        test_url: URL to test against (should return 200 if logged in)
+        method: HTTP method to use (GET or POST)
+        account: Optional account identifier
+    
+    Returns:
+        dict: {"valid": bool, "status_code": int, "reason": str}
+    """
+    import requests as req
+    
+    cookies = db.load_cookies(site, account=account)
+    if not cookies:
+        return {"valid": False, "status_code": 0, "reason": "no_cookies"}
+    
+    session = req.Session()
+    load_to_requests_session(session, site, account=account)
+    
+    try:
+        if method.upper() == "POST":
+            resp = session.post(test_url, timeout=15, allow_redirects=False)
+        else:
+            resp = session.get(test_url, timeout=15, allow_redirects=False)
+        
+        # Check for login redirect patterns
+        location = resp.headers.get("Location", "").lower()
+        login_patterns = ["login", "signin", "sign-in", "auth", "passport", "sso"]
+        is_login_redirect = any(p in location for p in login_patterns)
+        
+        if resp.status_code == 200:
+            db.update_cookie_validity(site, True, account=account)
+            return {"valid": True, "status_code": 200, "reason": "ok"}
+        elif resp.status_code in (301, 302, 303, 307, 308):
+            if is_login_redirect:
+                db.update_cookie_validity(site, False, account=account)
+                return {"valid": False, "status_code": resp.status_code, "reason": "login_redirect"}
+            else:
+                # Non-login redirect might still be valid
+                db.update_cookie_validity(site, True, account=account)
+                return {"valid": True, "status_code": resp.status_code, "reason": "redirect_non_login"}
+        elif resp.status_code == 401 or resp.status_code == 403:
+            db.update_cookie_validity(site, False, account=account)
+            return {"valid": False, "status_code": resp.status_code, "reason": "auth_failed"}
+        else:
+            db.update_cookie_validity(site, False, account=account)
+            return {"valid": False, "status_code": resp.status_code, "reason": f"http_{resp.status_code}"}
+            
+    except req.exceptions.Timeout:
+        return {"valid": False, "status_code": 0, "reason": "timeout"}
+    except req.exceptions.ConnectionError:
+        return {"valid": False, "status_code": 0, "reason": "connection_error"}
+    except Exception as e:
+        log.warning(f"Cookie validation failed for {site}: {e}")
+        return {"valid": False, "status_code": 0, "reason": f"error: {str(e)}"}
+
+
+def import_from_chrome(site, chrome_profile="Default", db_profile="default", account=None):
+    """
+    Import cookies from local Chrome browser into database.
+    
+    Args:
+        site: Domain to extract cookies for (e.g., "douyin.com")
+        chrome_profile: Chrome profile name (Default, Profile 1, etc.)
+        db_profile: Database profile name to save under
+        account: Optional account identifier to save under
+    
+    Returns:
+        dict: {"success": bool, "count": int, "message": str}
+    """
+    try:
+        cookies = chrome_cookies.get_chrome_cookies_for_site(site, chrome_profile)
+        
+        if not cookies:
+            return {"success": False, "count": 0, "message": f"No cookies found in Chrome for {site}"}
+        
+        # Save to database (use None for user_agent as we don't know Chrome's UA)
+        db.save_cookies(site, db_profile, cookies, user_agent=None, account=account)
+        log.info(f"Imported {len(cookies)} cookies from Chrome for {site}" + (f" (account: {account})" if account else ""))
+        
+        return {"success": True, "count": len(cookies), "message": f"Imported {len(cookies)} cookies"}
+        
+    except Exception as e:
+        log.error(f"Failed to import cookies from Chrome: {e}")
+        return {"success": False, "count": 0, "message": f"Error: {str(e)}"}
+
+
+def smart_load_cookies(driver, site, test_url=None, chrome_profile="Default", account=None):
+    """
+    Intelligent cookie loading with fallback chain:
+    1. Load from database (filtered by account if specified)
+    2. Validate via HTTP request (if test_url provided)
+    3. If invalid/missing, import from Chrome
+    4. Inject into driver
+    
+    Args:
+        driver: Selenium WebDriver
+        site: Domain/site key
+        test_url: URL to validate cookies (optional)
+        chrome_profile: Chrome profile for import fallback
+        account: Optional account identifier
+    
+    Returns:
+        dict: {"source": str, "count": int, "valid": bool, "account": str}
+    """
+    result = {"source": None, "count": 0, "valid": False, "account": account}
+    
+    # Step 1: Check database
+    db_cookies = db.load_cookies(site, account=account)
+    
+    if db_cookies:
+        log.info(f"Found {len(db_cookies)} cookies in database for {site}" + (f" (account: {account})" if account else ""))
+        
+        # Step 2: Validate if test_url provided
+        if test_url:
+            validation = validate_cookies(site, test_url, account=account)
+            if validation["valid"]:
+                count = load_to_driver(driver, site, account=account)
+                return {"source": "database", "count": count, "valid": True, "account": account}
+            else:
+                log.info(f"Database cookies invalid: {validation['reason']}")
+        else:
+            # No validation URL, assume valid
+            count = load_to_driver(driver, site, account=account)
+            return {"source": "database", "count": count, "valid": True, "account": account}
+    
+    # Step 3: Try Chrome import
+    log.info(f"Attempting to import from Chrome ({chrome_profile})...")
+    import_result = import_from_chrome(site, chrome_profile, account=account)
+    
+    if import_result["success"]:
+        # Validate imported cookies if test_url provided
+        if test_url:
+            validation = validate_cookies(site, test_url, account=account)
+            if not validation["valid"]:
+                log.warning(f"Imported Chrome cookies also invalid: {validation['reason']}")
+                return {"source": "chrome", "count": import_result["count"], "valid": False, "account": account}
+        
+        count = load_to_driver(driver, site, account=account)
+        return {"source": "chrome", "count": count, "valid": True, "account": account}
+    
+    log.warning(f"No valid cookies found for {site}" + (f" (account: {account})" if account else ""))
+    return {"source": None, "count": 0, "valid": False, "account": account}
+
+
+def list_chrome_profiles():
+    """List available Chrome profiles for cookie import."""
+    return chrome_cookies.list_chrome_profiles()
+
+
+def has_chrome_cookies(site, profile="Default"):
+    """Check if Chrome has cookies for a site."""
+    return chrome_cookies.has_chrome_cookies(site, profile)

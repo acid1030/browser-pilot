@@ -1,6 +1,7 @@
 """
 Browser Pilot - MySQL Backend
 Uses mysql-connector-python with connection pooling.
+Supports account-based cookie storage for multi-account scenarios.
 """
 import json
 import logging
@@ -18,13 +19,16 @@ def _now_iso():
 _SCHEMA_COOKIE_STORES = """
 CREATE TABLE IF NOT EXISTS cookie_stores (
     id INT AUTO_INCREMENT PRIMARY KEY,
-    site VARCHAR(255) UNIQUE NOT NULL,
+    site VARCHAR(255) NOT NULL,
+    account VARCHAR(255) NOT NULL DEFAULT '',
     profile VARCHAR(255) DEFAULT 'default',
     cookies_json LONGTEXT NOT NULL,
     user_agent VARCHAR(512),
     is_valid TINYINT(1) DEFAULT 1,
     created_at VARCHAR(32) NOT NULL,
-    updated_at VARCHAR(32) NOT NULL
+    updated_at VARCHAR(32) NOT NULL,
+    UNIQUE KEY uk_site_account (site, account),
+    INDEX idx_site_account (site, account)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
@@ -46,12 +50,15 @@ CREATE TABLE IF NOT EXISTS request_history (
 _SCHEMA_LOGIN_STATES = """
 CREATE TABLE IF NOT EXISTS login_states (
     id INT AUTO_INCREMENT PRIMARY KEY,
-    site VARCHAR(255) UNIQUE NOT NULL,
+    site VARCHAR(255) NOT NULL,
+    account VARCHAR(255) NOT NULL DEFAULT '',
     is_logged_in TINYINT(1) DEFAULT 0,
     check_url VARCHAR(512),
     check_selector VARCHAR(512),
     last_check VARCHAR(32),
-    last_login VARCHAR(32)
+    last_login VARCHAR(32),
+    UNIQUE KEY uk_site_account (site, account),
+    INDEX idx_site_account (site, account)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
@@ -126,55 +133,125 @@ class MySQLBackend(DatabaseBackend):
             cursor.execute(_SCHEMA_LOGIN_STATES)
             conn.commit()
             cursor.close()
+            
+            # Migration: add account column if missing
+            self._migrate_add_account_column(conn)
         finally:
             conn.close()
 
+    def _migrate_add_account_column(self, conn):
+        """Add account column to existing tables if not present."""
+        cursor = conn.cursor()
+        try:
+            # Check cookie_stores
+            cursor.execute("SHOW COLUMNS FROM cookie_stores LIKE 'account'")
+            if not cursor.fetchone():
+                cursor.execute("ALTER TABLE cookie_stores ADD COLUMN account VARCHAR(255) NOT NULL DEFAULT '' AFTER site")
+                cursor.execute("ALTER TABLE cookie_stores DROP INDEX site")
+                cursor.execute("ALTER TABLE cookie_stores ADD UNIQUE KEY uk_site_account (site, account)")
+                conn.commit()
+        except Exception:
+            pass
+        
+        try:
+            # Check login_states
+            cursor.execute("SHOW COLUMNS FROM login_states LIKE 'account'")
+            if not cursor.fetchone():
+                cursor.execute("ALTER TABLE login_states ADD COLUMN account VARCHAR(255) NOT NULL DEFAULT '' AFTER site")
+                cursor.execute("ALTER TABLE login_states DROP INDEX site")
+                cursor.execute("ALTER TABLE login_states ADD UNIQUE KEY uk_site_account (site, account)")
+                conn.commit()
+        except Exception:
+            pass
+        
+        cursor.close()
+
     # ─── Cookie Store ───
 
-    def save_cookies(self, site, profile, cookies_list, user_agent=None):
+    def save_cookies(self, site, profile, cookies_list, user_agent=None, account=None):
         ts = _now_iso()
+        account = account or ''
         cookies_json = json.dumps(cookies_list, ensure_ascii=False)
         self._exec("""
-            INSERT INTO cookie_stores (site, profile, cookies_json, user_agent, is_valid, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, 1, %s, %s)
+            INSERT INTO cookie_stores (site, account, profile, cookies_json, user_agent, is_valid, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, 1, %s, %s)
             ON DUPLICATE KEY UPDATE
                 profile=VALUES(profile),
                 cookies_json=VALUES(cookies_json),
                 user_agent=VALUES(user_agent),
                 is_valid=1,
                 updated_at=VALUES(updated_at)
-        """, (site, profile, cookies_json, user_agent, ts, ts), commit=True)
+        """, (site, account, profile, cookies_json, user_agent, ts, ts), commit=True)
 
-    def load_cookies(self, site):
-        row = self._exec(
-            "SELECT cookies_json FROM cookie_stores WHERE site = %s",
-            (site,), fetch="one"
-        )
+    def load_cookies(self, site, account=None):
+        if account:
+            row = self._exec(
+                "SELECT cookies_json FROM cookie_stores WHERE site = %s AND account = %s",
+                (site, account), fetch="one"
+            )
+        else:
+            # If no account specified, try exact empty match first, then any
+            row = self._exec(
+                "SELECT cookies_json FROM cookie_stores WHERE site = %s AND account = ''",
+                (site,), fetch="one"
+            )
+            if not row:
+                row = self._exec(
+                    "SELECT cookies_json FROM cookie_stores WHERE site = %s ORDER BY updated_at DESC LIMIT 1",
+                    (site,), fetch="one"
+                )
         if row:
             return json.loads(row["cookies_json"])
         return None
 
-    def list_cookie_sites(self):
-        rows = self._exec(
-            "SELECT site, profile, is_valid, updated_at FROM cookie_stores ORDER BY updated_at DESC",
-            fetch="all"
-        )
+    def list_cookie_sites(self, account=None):
+        if account:
+            rows = self._exec(
+                "SELECT site, account, profile, is_valid, updated_at FROM cookie_stores WHERE account = %s ORDER BY updated_at DESC",
+                (account,), fetch="all"
+            )
+        else:
+            rows = self._exec(
+                "SELECT site, account, profile, is_valid, updated_at FROM cookie_stores ORDER BY updated_at DESC",
+                fetch="all"
+            )
         return rows or []
 
-    def delete_cookies(self, site):
-        self._exec("DELETE FROM cookie_stores WHERE site = %s", (site,), commit=True)
+    def delete_cookies(self, site, account=None):
+        if account:
+            self._exec("DELETE FROM cookie_stores WHERE site = %s AND account = %s", (site, account), commit=True)
+        else:
+            self._exec("DELETE FROM cookie_stores WHERE site = %s", (site,), commit=True)
 
-    def update_cookie_validity(self, site, is_valid):
-        self._exec(
-            "UPDATE cookie_stores SET is_valid = %s, updated_at = %s WHERE site = %s",
-            (1 if is_valid else 0, _now_iso(), site), commit=True
-        )
+    def update_cookie_validity(self, site, is_valid, account=None):
+        if account:
+            self._exec(
+                "UPDATE cookie_stores SET is_valid = %s, updated_at = %s WHERE site = %s AND account = %s",
+                (1 if is_valid else 0, _now_iso(), site, account), commit=True
+            )
+        else:
+            self._exec(
+                "UPDATE cookie_stores SET is_valid = %s, updated_at = %s WHERE site = %s",
+                (1 if is_valid else 0, _now_iso(), site), commit=True
+            )
 
-    def get_cookie_store(self, site):
-        return self._exec(
-            "SELECT * FROM cookie_stores WHERE site = %s",
-            (site,), fetch="one"
-        )
+    def get_cookie_store(self, site, account=None):
+        if account:
+            return self._exec(
+                "SELECT * FROM cookie_stores WHERE site = %s AND account = %s",
+                (site, account), fetch="one"
+            )
+        else:
+            row = self._exec(
+                "SELECT * FROM cookie_stores WHERE site = %s AND account = ''",
+                (site,), fetch="one"
+            )
+            if not row:
+                row = self._exec(
+                    "SELECT * FROM cookie_stores WHERE site = %s ORDER BY updated_at DESC LIMIT 1",
+                    (site,), fetch="one"
+                )
+            return row
 
     # ─── Request History ───
 
@@ -213,23 +290,36 @@ class MySQLBackend(DatabaseBackend):
 
     # ─── Login State ───
 
-    def update_login_state(self, site, is_logged_in, check_url=None, check_selector=None):
+    def update_login_state(self, site, is_logged_in, check_url=None, check_selector=None, account=None):
         ts = _now_iso()
+        account = account or ''
         last_login = ts if is_logged_in else None
         self._exec("""
-            INSERT INTO login_states (site, is_logged_in, check_url, check_selector, last_check, last_login)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO login_states (site, account, is_logged_in, check_url, check_selector, last_check, last_login)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 is_logged_in=VALUES(is_logged_in),
                 check_url=COALESCE(VALUES(check_url), check_url),
                 check_selector=COALESCE(VALUES(check_selector), check_selector),
                 last_check=VALUES(last_check),
                 last_login=COALESCE(VALUES(last_login), last_login)
-        """, (site, 1 if is_logged_in else 0, check_url, check_selector, ts, last_login),
+        """, (site, account, 1 if is_logged_in else 0, check_url, check_selector, ts, last_login),
             commit=True)
 
-    def get_login_state(self, site):
-        return self._exec(
-            "SELECT * FROM login_states WHERE site = %s",
-            (site,), fetch="one"
-        )
+    def get_login_state(self, site, account=None):
+        if account:
+            return self._exec(
+                "SELECT * FROM login_states WHERE site = %s AND account = %s",
+                (site, account), fetch="one"
+            )
+        else:
+            row = self._exec(
+                "SELECT * FROM login_states WHERE site = %s AND account = ''",
+                (site,), fetch="one"
+            )
+            if not row:
+                row = self._exec(
+                    "SELECT * FROM login_states WHERE site = %s ORDER BY last_check DESC LIMIT 1",
+                    (site,), fetch="one"
+                )
+            return row
