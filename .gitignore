@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Database files (local dev only)
+*.db
+db_config.json
+
+# Chrome profiles
+chrome-profiles/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Screenshots (temp)
+*.png
+*.jpg
+!docs/*.png
