@@ -161,11 +161,15 @@ class PlaywrightBrowser:
         # Convert to Playwright format
         pw_cookies = cookie_manager.cookies_to_playwright_format(cookies_list)
         
-        # Filter out invalid cookies
+        # Filter out invalid cookies (must have name and domain)
         valid_cookies = []
         for c in pw_cookies:
-            if c.get("name") and c.get("domain"):
+            name = c.get("name", "").strip()
+            domain = c.get("domain", "").strip()
+            if name and domain:
                 valid_cookies.append(c)
+            else:
+                log.debug(f"Skipping invalid cookie: name='{name}', domain='{domain}'")
         
         if valid_cookies:
             self.context.add_cookies(valid_cookies)
