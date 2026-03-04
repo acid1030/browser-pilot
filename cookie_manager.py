@@ -217,8 +217,8 @@ def cookies_to_playwright_format(db_cookies):
             "value": c["value"],
             "domain": c.get("domain", ""),
             "path": c.get("path", "/"),
-            "secure": c.get("secure", False),
-            "httpOnly": c.get("httpOnly", False),
+            "secure": bool(c.get("secure", False)),  # Ensure boolean
+            "httpOnly": bool(c.get("httpOnly", False)),  # Ensure boolean
         }
         # expiry -> expires
         if c.get("expiry"):
@@ -252,8 +252,8 @@ def cookies_from_playwright_format(pw_cookies):
             "value": c["value"],
             "domain": c.get("domain", ""),
             "path": c.get("path", "/"),
-            "secure": c.get("secure", False),
-            "httpOnly": c.get("httpOnly", False),
+            "secure": bool(c.get("secure", False)),  # Ensure boolean
+            "httpOnly": bool(c.get("httpOnly", False)),  # Ensure boolean
         }
         # expires -> expiry
         expires = c.get("expires", -1)
